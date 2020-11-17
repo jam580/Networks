@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <time.h>
 
 struct blockstruct
 {
@@ -22,7 +23,7 @@ Block* initBlock()
 {
     Block* b1 = malloc(sizeof(Block));
     b1->Object = (char*) malloc(1024*10240);
-    b1->key = malloc(sizeof(char)*100);
+    b1->key = calloc(100, sizeof(char));
     b1->valid = 0;
     return b1;
 };
@@ -159,7 +160,7 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         fflush(sockwfp);
 
         //recieve response form server and forward to client
-        char* buff = malloc(1024*1024);
+        char* buff = calloc(1024*1024, sizeof(char));
         con_length = -1;
         first_line = 1;
         stat = -1;
@@ -250,7 +251,7 @@ int main(int argc, char **argv) {
     int portno; // port to listen on 
     int accessport; //port of website to be accessed
     unsigned short finport; //final port for relay
-    int addresslen; // byte size of client address 
+    socklen_t addresslen; // byte size of client address 
     int optval; // flag value for setsockopt 
     FILE* sockrfp; // read socket file 
     FILE* sockwfp;// write socket file 
@@ -302,7 +303,7 @@ int main(int argc, char **argv) {
     /***************************************************
      ****** main loop to handle socket connections******
      ***************************************************/
-
+    memset(&addresslen, '\0', sizeof(addresslen));
     while(1){
         /* 
         * accept: wait for a connection request 

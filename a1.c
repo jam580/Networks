@@ -347,7 +347,6 @@ int main(int argc, char **argv) {
                 {
                     FD_SET(childfd, &master_fds);
                     fdmax = MAX(childfd, fdmax);
-                    printf("Accepted %d\n", childfd);
                 }
             } 
             else 
@@ -363,6 +362,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Failed to get Request\n");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    continue;
                 }
                 //clean up and parse request
                 trim(line);
@@ -371,6 +371,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Failed to Parse Request\n");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    continue;
                 }
 
                 //ensure http is lower case
@@ -414,6 +415,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Bad address not found");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    continue;
                 }
 
                 //loop through fulladdress info for ipv4 or ipv6 addresses
@@ -460,12 +462,14 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Couldnt form server socket");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    continue;
                 }
                 if( connect(serversock, (struct sockaddr*) &finsock, sock_len) <0) 
                 {
                     fprintf(stderr, "Couldn't connect to server");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    continue;
                 }
 
                 //Now client socket has been connected to server
@@ -474,11 +478,10 @@ int main(int argc, char **argv) {
                 sockrfp = fdopen(serversock, "r");
                 sockwfp = fdopen(serversock, "w");
                 FILE* clientsock = fdopen(childfd, "w");
-                relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url); // TODO look at error handling
+                relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url);
                 close(serversock);
                 close(childfd); 
                 FD_CLR(childfd, &master_fds);
-                printf("Closing %d\n", childfd);
             }
         }
     }//while loop

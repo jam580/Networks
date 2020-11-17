@@ -8,6 +8,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <signal.h>
+#include "failure.h"
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 struct blockstruct
 {
@@ -257,7 +262,10 @@ int main(int argc, char **argv) {
     FILE* sockwfp;// write socket file 
     struct sockaddr_in serveraddr; // server's addr 
     Cache* cache = initCache(10);
-    
+    fd_set master_fds;
+    fd_set read_fds;
+    int fdmax;
+    int sckt; // looping variable
 
     //check command line arguments 
     if (argc != 2) {
@@ -299,122 +307,180 @@ int main(int argc, char **argv) {
     if (listen(parentfd, 5) < 0) // allow 5 requests to queue up  
         error("ERROR on listen");
 
+    /*
+     * Clear memory in fdsets
+     */
+    FD_ZERO(&master_fds);
+    FD_ZERO(&read_fds);
+    FD_SET(parentfd, &master_fds);
+    fdmax = parentfd;
+
+    signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE
 
     /***************************************************
      ****** main loop to handle socket connections******
      ***************************************************/
     memset(&addresslen, '\0', sizeof(addresslen));
     while(1){
-        /* 
-        * accept: wait for a connection request 
-        */
-        childfd = accept(parentfd, (struct sockaddr *) &serveraddr, &addresslen);
-        if (childfd < 0) 
-            error("ERROR on accept");
+        read_fds = master_fds;
 
-        int stdin_save = dup(STDIN_FILENO); // saved stdin for potential reset 
-        dup2(childfd,STDIN_FILENO); // set stdin to client socket 
+        /*
+         * select: wait for a socket to be ready
+         */
+        if (select(fdmax+1, &read_fds, NULL, NULL, NULL) < 0)
+            exit_failure("ERROR on select\n");
 
-        //start reading request from STDIN
-        if( fgets(line, sizeof(line), stdin)== (char*)0)
-            error("Failed to get Request");
-        //clean up and parse request
-        trim(line);
-        if(sscanf( line, "%[^ ] %[^ ] %[^ ]", method, url, protocol ) != 3 )
-            error("Failed to Parse Request");
-
-        //ensure http is lower case
-        strncpy( url, "http", 4 );
-        
-        update(cache);
-
-
-        //break apart the url and get host / path / port if they exist
-        //I referenced a few pages to help with this part including:
-        //https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
-
-        //if sscanf properly parses hostname into host buffer, a port number into accessport, 
-        // and the rest into path
-        if(sscanf( url, "http://%[^:/]:%d%s", host, &accessport, path)==3)
-            finport = (unsigned short) accessport;
-        //if no port is specified assume 80
-        else if (sscanf( url, "http://%[^:/]%s", host, path)==2)
-            finport = 80;
-
-
-        //Start building destination
-        //build the server's Internet address
-        struct addrinfo destaddr; //destinatrion addr
-        char portarray[10];
-        struct addrinfo* fullinfo;
-        struct sockaddr_in6 finsock;\
-        int sock_fam, sock_type, sock_prot, sock_len;
-        int serversock;
-        //initialize some values
-        memset(&destaddr, 0, sizeof (destaddr));
-        memset( (void*) &finsock, 0, sizeof(finsock) );
-
-        destaddr.ai_family = PF_UNSPEC;
-        destaddr.ai_socktype = SOCK_STREAM;
-        //copy port into array
-        snprintf( portarray, sizeof(portarray), "%d", (int) finport );
-        //perform lookup
-        if( (getaddrinfo(host, portarray, &destaddr, &fullinfo))!=0)
-            error("Bad address not found");
-
-        //loop through fulladdress info for ipv4 or ipv6 addresses
-        struct addrinfo* ipv4 = (struct addrinfo*) 0;
-        struct addrinfo* ipv6 = (struct addrinfo*) 0;
-        for(struct addrinfo* i =fullinfo; i != (struct addrinfo*) 0; i=i->ai_next)
+        for (sckt = 0; sckt <= fdmax; sckt++) 
         {
-            //switch on address info family type to match ipv4 vs 6
-            switch (i->ai_family)
+            if (!FD_ISSET(sckt, &read_fds))
+                continue;
+            
+            if (sckt == parentfd) 
             {
-            case AF_INET:
-                if(ipv4== (struct addrinfo*) 0)
-                    ipv4 = i;
-                break;
-            case AF_INET6:
-            if(ipv6== (struct addrinfo*) 0)
-                ipv6 = i;
-            break;
+                /* Incoming connection request */
+                childfd = accept(parentfd, (struct sockaddr *) &serveraddr, &addresslen);
+                if (childfd < 0) 
+                {
+                    fprintf(stderr, "ERROR on accept\n");
+                }
+                else
+                {
+                    FD_SET(childfd, &master_fds);
+                    fdmax = MAX(childfd, fdmax);
+                    printf("Accepted %d\n", childfd);
+                }
+            } 
+            else 
+            {
+                childfd = sckt;
+                /* Data arriving from already connected socket */
+                // int stdin_save = dup(STDIN_FILENO); // saved stdin for potential reset 
+                dup2(childfd,STDIN_FILENO); // set stdin to client socket 
+
+                //start reading request from STDIN
+                if( fgets(line, sizeof(line), stdin)== (char*)0)
+                {
+                    fprintf(stderr, "Failed to get Request\n");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                }
+                //clean up and parse request
+                trim(line);
+                if(sscanf( line, "%[^ ] %[^ ] %[^ ]", method, url, protocol ) != 3 )
+                {
+                    fprintf(stderr, "Failed to Parse Request\n");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                }
+
+                //ensure http is lower case
+                strncpy( url, "http", 4 ); // TODO why is this necessary?
+                
+                update(cache);
+
+
+                //break apart the url and get host / path / port if they exist
+                //I referenced a few pages to help with this part including:
+                //https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
+
+                //if sscanf properly parses hostname into host buffer, a port number into accessport, 
+                // and the rest into path
+                if(sscanf( url, "http://%[^:/]:%d%s", host, &accessport, path)==3)
+                    finport = (unsigned short) accessport;
+                //if no port is specified assume 80
+                else if (sscanf( url, "http://%[^:/]%s", host, path)==2)
+                    finport = 80;
+
+
+                //Start building destination
+                //build the server's Internet address
+                struct addrinfo destaddr; //destinatrion addr
+                char portarray[10];
+                struct addrinfo* fullinfo;
+                struct sockaddr_in6 finsock;\
+                int sock_fam, sock_type, sock_prot, sock_len;
+                int serversock;
+                //initialize some values
+                memset(&destaddr, 0, sizeof (destaddr));
+                memset( (void*) &finsock, 0, sizeof(finsock) );
+
+                destaddr.ai_family = PF_UNSPEC;
+                destaddr.ai_socktype = SOCK_STREAM;
+                //copy port into array
+                snprintf( portarray, sizeof(portarray), "%d", (int) finport );
+                //perform lookup
+                if( (getaddrinfo(host, portarray, &destaddr, &fullinfo))!=0)
+                {
+                    fprintf(stderr, "Bad address not found");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                }
+
+                //loop through fulladdress info for ipv4 or ipv6 addresses
+                struct addrinfo* ipv4 = (struct addrinfo*) 0;
+                struct addrinfo* ipv6 = (struct addrinfo*) 0;
+                for(struct addrinfo* i =fullinfo; i != (struct addrinfo*) 0; i=i->ai_next)
+                {
+                    //switch on address info family type to match ipv4 vs 6
+                    switch (i->ai_family)
+                    {
+                    case AF_INET:
+                        if(ipv4== (struct addrinfo*) 0)
+                            ipv4 = i;
+                        break;
+                    case AF_INET6:
+                    if(ipv6== (struct addrinfo*) 0)
+                        ipv6 = i;
+                    break;
+                    }
+                }
+                //use ipv4 address if found
+                if(ipv4 !=(struct addrinfo*) 0)
+                {
+                    sock_fam = ipv4->ai_family;
+                    sock_type = ipv4->ai_socktype;
+                    sock_prot = ipv4->ai_protocol;
+                    sock_len = ipv4->ai_addrlen;
+                    memmove(&finsock, ipv4->ai_addr, sock_len);
+                }
+                //use ipv6
+                else
+                {
+                    sock_fam = ipv6->ai_family;
+                    sock_type = ipv6->ai_socktype;
+                    sock_prot = ipv6->ai_protocol;
+                    sock_len = ipv6->ai_addrlen;
+                    memmove(&finsock, ipv6->ai_addr, sock_len);
+                }
+
+                //now that final socket info is set up open socket to server
+                serversock = socket(sock_fam, sock_type, sock_prot);
+                if(serversock<0)
+                {
+                    fprintf(stderr, "Couldnt form server socket");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                }
+                if( connect(serversock, (struct sockaddr*) &finsock, sock_len) <0) 
+                {
+                    fprintf(stderr, "Couldn't connect to server");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                }
+
+                //Now client socket has been connected to server
+                //open read and write channels
+                
+                sockrfp = fdopen(serversock, "r");
+                sockwfp = fdopen(serversock, "w");
+                FILE* clientsock = fdopen(childfd, "w");
+                relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url); // TODO look at error handling
+                close(serversock);
+                close(childfd); 
+                FD_CLR(childfd, &master_fds);
+                printf("Closing %d\n", childfd);
             }
         }
-        //use ipv4 address if found
-        if(ipv4 !=(struct addrinfo*) 0)
-        {
-            sock_fam = ipv4->ai_family;
-            sock_type = ipv4->ai_socktype;
-            sock_prot = ipv4->ai_protocol;
-            sock_len = ipv4->ai_addrlen;
-            memmove(&finsock, ipv4->ai_addr, sock_len);
-        }
-        //use ipv6
-        else
-        {
-            sock_fam = ipv6->ai_family;
-            sock_type = ipv6->ai_socktype;
-            sock_prot = ipv6->ai_protocol;
-            sock_len = ipv6->ai_addrlen;
-            memmove(&finsock, ipv6->ai_addr, sock_len);
-        }
-
-        //now that final socket info is set up open socket to server
-        serversock = socket(sock_fam, sock_type, sock_prot);
-        if(serversock<0)
-            error("Couldnt form server socket");
-        if( connect(serversock, (struct sockaddr*) &finsock, sock_len) <0) 
-            error("Couldn't connect to server");
-
-        //Now client socket has been connected to server
-        //open read and write channels
-        
-        sockrfp = fdopen(serversock, "r");
-        sockwfp = fdopen(serversock, "w");
-        FILE* clientsock = fdopen(childfd, "w");
-        relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url);
-        close(serversock);
-        close(childfd); 
     }//while loop
     
 }

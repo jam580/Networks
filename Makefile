@@ -31,6 +31,7 @@ LDFLAGS = -g
 
 # Linking libraries
 LDLIBS = -lnsl
+LDLIBS_LOCAL = ""
 
 # 
 #    'make all' will build all executables
@@ -61,3 +62,6 @@ clean:
 #
 server: a1.o list.o mem.o failure.o
 	$(CC) $(LDFLAGS) -o server a1.o list.o mem.o failure.o $(LDLIBS)
+
+server_local: a1.o list.o mem.o failure.o
+	$(CC) $(LDFLAGS) -o server a1.o list.o mem.o failure.o $(LDLIBS_LOCAL)

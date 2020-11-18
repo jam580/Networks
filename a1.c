@@ -10,6 +10,7 @@
 #include <time.h>
 #include <signal.h>
 #include "failure.h"
+#include "mem.h"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -30,6 +31,7 @@ Block* initBlock()
     b1->Object = (char*) malloc(1024*10240);
     b1->key = calloc(100, sizeof(char));
     b1->valid = 0;
+    b1->firstline = calloc(1, sizeof(char));
     return b1;
 };
 struct cachestruct
@@ -80,7 +82,7 @@ void error(char *msg) {
 static void trim(char* segment)
 {
     int i = strlen(segment);
-    while(segment[i-1] =='\n' ||segment[i-1] =='\r')
+    while(i > 0 && (segment[i-1] =='\n' ||segment[i-1] =='\r'))
         segment[--i] = '\0';
 }
 //find url in cache entry and return index of said entry
@@ -101,8 +103,16 @@ static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, F
     fd_set master;
     int maxp, r;
     char buff[10000];
-    timeout.tv_sec = 3;
+    timeout.tv_sec = 1;
     timeout.tv_usec =0;
+
+    // clear unusued parameter warnings
+    (void)method;
+    (void)host;
+    (void)protocol;
+    (void)cache;
+    (void)url;
+
     //return proxy header to client
     fputs("HTTP/1.0 200 Connection established\r\n\r\n", clientsock);
     fflush (clientsock);
@@ -119,7 +129,6 @@ static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, F
     {
         maxp = server_read +1;
     }
-    int doneread, donewrite=0;
 
     while(1)
     {
@@ -132,15 +141,12 @@ static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, F
         r = select (maxp, &master, (fd_set*) 0, (fd_set*) 0, &timeout);
         if(r==0)
         {
-            donewrite=1;
-            doneread=1;
-            break;
-        }
-            
+            break; // send timeout so client stops communicating
+        } 
         else if (FD_ISSET(client_read, &master))
         {
             printf("Client\n");
-            r = read(fileno(stdin), buff, sizeof(buff));
+            r = read(client_read, buff, sizeof(buff));
             if (r<=0)
                 break;
             r= write(server_write, buff, r);
@@ -153,7 +159,7 @@ static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, F
             printf("Read %d bytes\n", r);
             if(r<=0)
                 break;
-            r = write(fileno(clientsock), buff, r);
+            r = write(client_write, buff, r);
             if(r<=0)
                 break;
         }
@@ -289,7 +295,7 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
                 hold = fgetc(sockrfp);
                 //fputc(hold,clientsock);
                 //fflush(clientsock);
-                strncat(buff,&hold,sizeof(hold));
+                strncat(buff,&hold,1); // TODO: store partial messages in case buff is not big enough
                 fprintf(clientsock,"%c", hold);
                 
             }
@@ -316,8 +322,11 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         strcpy(cache->Entries[found]->key, url);
         cache->Entries[found]->maxage=age;
         cache->Entries[found]->intime=time(NULL);
+        FREE(cache->Entries[found]->firstline);
         cache->Entries[found]->firstline=strdup(firstlen);
         //value is now cached
+        FREE(firstlen);
+        FREE(buff);
     }//end of cache miss   
 }
 
@@ -432,7 +441,7 @@ int main(int argc, char **argv) {
                 dup2(childfd,STDIN_FILENO); // set stdin to client socket 
 
                 //start reading request from STDIN
-                if( fgets(line, sizeof(line), stdin)== (char*)0)
+                if( fgets(line, sizeof(line)-1, stdin)== (char*)0)
                 {
                     fprintf(stderr, "Failed to get Request\n");
                     close(childfd);
@@ -462,7 +471,7 @@ int main(int argc, char **argv) {
                 update(cache);
                 if(strcmp(method, "GET") == 0 && strncasecmp(url, "http://", 7) == 0)
                 {
-                    strncpy( url, "http", 4 );
+                    memcpy( url, "http", 4 );
 
                     if(sscanf( url, "http://%[^:/]:%d%s", host, &accessport, path)==3)
                         finport = (unsigned short) accessport;
@@ -543,6 +552,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Bad address not found");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    freeaddrinfo(fullinfo);
                     continue;
                 }
 
@@ -626,10 +636,11 @@ int main(int argc, char **argv) {
                 {
                     printf("Line is: %s\n", line);
                 }*/
+                freeaddrinfo(fullinfo);
                 close(serversock);
                 //dup2(stdin_save,STDIN_FILENO);
-                close(childfd); 
-                FD_CLR(childfd, &master_fds);
+                //close(childfd); // TODO: add support to keep-alive
+                //FD_CLR(childfd, &master_fds);
             }
         }
     }//while loop

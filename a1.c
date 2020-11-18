@@ -377,7 +377,8 @@ int main(int argc, char **argv) {
      ****** main loop to handle socket connections******
      ***************************************************/
 
-    while(1){
+    while(1)
+    {
         /* 
         * accept: wait for a connection request 
         */
@@ -399,12 +400,17 @@ int main(int argc, char **argv) {
             printf("Line is: %s\n", line);
             error("Failed to Parse Request");
         }
-            
-
         if(url[0] =='\0')
             error("Bad url on Request");
 
         update(cache);
+
+        //break apart the url and get host / path / port if they exist
+        //I referenced a few pages to help with this part including:
+        //https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
+
+        //if sscanf properly parses hostname into host buffer, a port number into accessport, 
+        // and the rest into path
         if(strncasecmp(url, "http://", 7) == 0)
         {
             strncpy( url, "http", 4 );
@@ -414,20 +420,16 @@ int main(int argc, char **argv) {
             //if no port is specified assume 80
             else if (sscanf( url, "http://%[^:/]%s", host, path)==2)
                 finport = 80;
-            else if (sscanf( url, "http://%[^:/]:%d", host, &accessport)==2)
-            {
-                finport = (unsigned short) accessport;
-                *path = '\0';
-            }
-            else if (sscanf (url, "http://%[^/]", host)==1)
-            {
-                finport = 80;
-                *path = '\0';
-            }
-            else
-            {
-                error("Could not sscanf on url");
-            }
+            // else if (sscanf( url, "http://%[^:/]:%d", host, &accessport)==2)
+            // {
+            //     finport = (unsigned short) accessport;
+            //     *path = '\0';
+            // }
+            // else if (sscanf (url, "http://%[^/]", host)==1)
+            // {
+            //     finport = 80;
+            //     *path = '\0';
+            // }
             https = 0;    
         }
         else if (strcmp(method, "CONNECT")==0) //check for https request
@@ -441,18 +443,7 @@ int main(int argc, char **argv) {
                 error("Failed to parse https url");
             }
             https = 1;
-        }
-
-        
-
-        //break apart the url and get host / path / port if they exist
-        //I referenced a few pages to help with this part including:
-        //https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
-
-        //if sscanf properly parses hostname into host buffer, a port number into accessport, 
-        // and the rest into path
-        
-
+        } 
 
         //Start building destination
         //build the server's Internet address
@@ -535,11 +526,6 @@ int main(int argc, char **argv) {
             printf("routing client\n");
             printf("url is: %s\n", url);
             relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url);
-        }
-        //flush input
-        while(fgets(line, sizeof(line), stdin) != (char*)0 )
-        {
-            printf("Line is: %s\n", line);
         }
         close(serversock);
         //dup2(stdin_save,STDIN_FILENO);

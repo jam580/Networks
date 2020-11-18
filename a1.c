@@ -134,6 +134,7 @@ static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, F
         {
             donewrite=1;
             doneread=1;
+            break;
         }
             
         else if (FD_ISSET(client_read, &master))
@@ -230,7 +231,7 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         fflush(sockwfp);
 
         //recieve response form server and forward to client
-        char* buff = calloc(1024*1024*1024, sizeof(char));
+        char* buff = calloc(1024*1024, sizeof(char));
         con_length = -1;
         first_line = 1;
         stat = -1;
@@ -459,7 +460,7 @@ int main(int argc, char **argv) {
                 }
                 
                 update(cache);
-                if(strncasecmp(url, "http://", 7) == 0)
+                if(strcmp(method, "GET") == 0 && strncasecmp(url, "http://", 7) == 0)
                 {
                     strncpy( url, "http", 4 );
 
@@ -468,6 +469,7 @@ int main(int argc, char **argv) {
                     //if no port is specified assume 80
                     else if (sscanf( url, "http://%[^:/]%s", host, path)==2)
                         finport = 80;
+                    /*
                     else if (sscanf( url, "http://%[^:/]:%d", host, &accessport)==2)
                     {
                         finport = (unsigned short) accessport;
@@ -484,7 +486,7 @@ int main(int argc, char **argv) {
                         close(childfd);
                         FD_CLR(childfd, &master_fds);
                         continue;
-                    }
+                    }*/
                     https = 0;    
                 }
                 else if (strcmp(method, "CONNECT")==0) //check for https request
@@ -502,6 +504,14 @@ int main(int argc, char **argv) {
                     }
                     https = 1;
                 }
+                else
+                {
+                        fprintf(stderr, "Unsupported method\n");
+                        close(childfd);
+                        FD_CLR(childfd, &master_fds);
+                        continue;
+                }
+                
 
                 //break apart the url and get host / path / port if they exist
                 //I referenced a few pages to help with this part including:
@@ -601,18 +611,21 @@ int main(int argc, char **argv) {
                     printf("Routting https!\n");
                     printf("Url is: %s\n", url);
                     relay_ssl(method, host, protocol, sockrfp, sockwfp, clientsock, cache, url);
+                    printf("Finished routing\n");
                 }
                 else
                 {
                     printf("routing client\n");
                     printf("url is: %s\n", url);
                     relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url);
+                    printf("Finished routing\n");
                 }
+                /*
                 //flush input
                 while(fgets(line, sizeof(line), stdin) != (char*)0 )
                 {
                     printf("Line is: %s\n", line);
-                }
+                }*/
                 close(serversock);
                 //dup2(stdin_save,STDIN_FILENO);
                 close(childfd); 

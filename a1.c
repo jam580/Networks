@@ -7,6 +7,13 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <time.h>
+#include <signal.h>
+#include "failure.h"
+#include "mem.h"
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 struct blockstruct
 {
@@ -22,8 +29,9 @@ Block* initBlock()
 {
     Block* b1 = malloc(sizeof(Block));
     b1->Object = (char*) malloc(1024*10240);
-    b1->key = malloc(sizeof(char)*100);
+    b1->key = calloc(100, sizeof(char));
     b1->valid = 0;
+    b1->firstline = calloc(1, sizeof(char));
     return b1;
 };
 struct cachestruct
@@ -74,7 +82,7 @@ void error(char *msg) {
 static void trim(char* segment)
 {
     int i = strlen(segment);
-    while(segment[i-1] =='\n' ||segment[i-1] =='\r')
+    while(i > 0 && (segment[i-1] =='\n' ||segment[i-1] =='\r'))
         segment[--i] = '\0';
 }
 //find url in cache entry and return index of said entry
@@ -87,6 +95,75 @@ int find(char* url, Cache* cache)
             return i;
     }
     return -1;
+}
+static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, FILE* sockwfp, FILE * clientsock, Cache* cache, char*url)
+{
+    int client_read, server_read, client_write, server_write;
+    struct timeval timeout;
+    fd_set master;
+    int maxp, r;
+    char buff[10000];
+    timeout.tv_sec = 1;
+    timeout.tv_usec =0;
+
+    // clear unusued parameter warnings
+    (void)method;
+    (void)host;
+    (void)protocol;
+    (void)cache;
+    (void)url;
+
+    //return proxy header to client
+    fputs("HTTP/1.0 200 Connection established\r\n\r\n", clientsock);
+    fflush (clientsock);
+
+    //set up other file handles
+    server_read = fileno(sockrfp);
+    server_write = fileno(sockwfp);
+    client_read = fileno(stdin);
+    client_write = fileno(clientsock);
+
+    if(client_read >= server_read)
+        maxp = client_read+1;
+    else
+    {
+        maxp = server_read +1;
+    }
+
+    while(1)
+    {
+        //printf("read %d, write %d \n", doneread, donewrite);
+        FD_ZERO( &master);
+        FD_SET(client_read, &master);
+        FD_SET(server_read, &master);
+
+        //printf("About to select\n");
+        r = select (maxp, &master, (fd_set*) 0, (fd_set*) 0, &timeout);
+        if(r==0)
+        {
+            break; // send timeout so client stops communicating
+        } 
+        else if (FD_ISSET(client_read, &master))
+        {
+            printf("Client\n");
+            r = read(client_read, buff, sizeof(buff));
+            if (r<=0)
+                break;
+            r= write(server_write, buff, r);
+            if (r<=0)
+                break;
+        }
+        else if (FD_ISSET(server_read, &master))
+        {
+            r = read(server_read, buff, sizeof(buff));
+            printf("Read %d bytes\n", r);
+            if(r<=0)
+                break;
+            r = write(client_write, buff, r);
+            if(r<=0)
+                break;
+        }
+    }
 }
 
 static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, FILE* sockwfp, FILE* clientsock, Cache* cache, char* url)
@@ -139,6 +216,7 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         //make sure all info is sent
         while(fgets(line, sizeof(line), stdin) != (char*)0 )
         {
+            //printf("Next line is: %s\n", line);
             if( strcmp( line, "\n" ) == 0 || strcmp( line, "\r\n" ) == 0 )
                 break;
             fputs(line, sockwfp);
@@ -159,7 +237,7 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         fflush(sockwfp);
 
         //recieve response form server and forward to client
-        char* buff = malloc(1024*1024);
+        char* buff = calloc(1024*1024, sizeof(char));
         con_length = -1;
         first_line = 1;
         stat = -1;
@@ -167,6 +245,7 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         char* firstlen;
         while( fgets(line, sizeof(line), sockrfp)!= (char*) 0)
         {
+            //printf("Newline inside relayhttp: %s\n", line);
             
             if( strcmp(line, "\n") ==0 || strcmp(line, "\r\n") ==0 )
                 break;
@@ -174,15 +253,18 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
             {
                 firstlen = strdup(line);
                 fprintf(clientsock, "%s", line);
+                fflush(clientsock);
+                strcpy(buff, line);
                 trim(line);
                 sscanf(line, "%[^ ] %d %s", prot, &stat, coms);
                 first_line=0;
             }
             else
             {
-                strncat(buff,line,sizeof(line));
+                strcat(buff,line);
+                fprintf(clientsock, "%s", line);
+                fflush(clientsock);
                 trim( line);
-                //grab the first line
                 
                 if (strncasecmp(line, "Content-Length:",15)==0)
                     con_length = atol( &(line[15]));
@@ -195,25 +277,30 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         } //end of reading headers
         if(!cacheage)
             age = 3600;
-        //Add the end of the header 
+        //Add the end of the header
         char* end = "\r\n";
-        strncat(buff,end,sizeof(end));
+        //fprintf(clientsock, "%s", end); 
+        fprintf(clientsock, "%s", end);
+        fflush(clientsock);
+        
+        strcat(buff,end);
+        //strcat(buff,"Connection: close\r\n");
 
         //check for content
         if(con_length != -1)
         {
+            printf("We have %ld content\n", con_length);
             for(i=0; i<con_length; i++)
             {
                 hold = fgetc(sockrfp);
                 //fputc(hold,clientsock);
                 //fflush(clientsock);
-                strncat(buff,&hold,sizeof(hold));
-                if(i==10000)
-                    break;
+                strncat(buff,&hold,1); // TODO: store partial messages in case buff is not big enough
+                fprintf(clientsock,"%c", hold);
+                
             }
         }
-        //Send entire http response to client
-        fprintf(clientsock, "%s", buff);
+        //flush content to client
         fflush(clientsock);
 
         //Cache value - found should be -1
@@ -235,11 +322,12 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         strcpy(cache->Entries[found]->key, url);
         cache->Entries[found]->maxage=age;
         cache->Entries[found]->intime=time(NULL);
+        FREE(cache->Entries[found]->firstline);
         cache->Entries[found]->firstline=strdup(firstlen);
         //value is now cached
-    }//end of cache miss
-    
-    
+        FREE(firstlen);
+        FREE(buff);
+    }//end of cache miss   
 }
 
 int main(int argc, char **argv) {
@@ -248,15 +336,19 @@ int main(int argc, char **argv) {
     int parentfd; // parent socket 
     int childfd; // child socket 
     int portno; // port to listen on 
+    int https; //bit to see if we need to relay https
     int accessport; //port of website to be accessed
     unsigned short finport; //final port for relay
-    int addresslen; // byte size of client address 
+    socklen_t addresslen; // byte size of client address 
     int optval; // flag value for setsockopt 
     FILE* sockrfp; // read socket file 
     FILE* sockwfp;// write socket file 
     struct sockaddr_in serveraddr; // server's addr 
     Cache* cache = initCache(10);
-    
+    fd_set master_fds;
+    fd_set read_fds;
+    int fdmax;
+    int sckt; // looping variable
 
     //check command line arguments 
     if (argc != 2) {
@@ -298,122 +390,259 @@ int main(int argc, char **argv) {
     if (listen(parentfd, 5) < 0) // allow 5 requests to queue up  
         error("ERROR on listen");
 
+    /*
+     * Clear memory in fdsets
+     */
+    FD_ZERO(&master_fds);
+    FD_ZERO(&read_fds);
+    FD_SET(parentfd, &master_fds);
+    fdmax = parentfd;
+
+    signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE
 
     /***************************************************
      ****** main loop to handle socket connections******
      ***************************************************/
-
+    memset(&addresslen, '\0', sizeof(addresslen));
     while(1){
-        /* 
-        * accept: wait for a connection request 
-        */
-        childfd = accept(parentfd, (struct sockaddr *) &serveraddr, &addresslen);
-        if (childfd < 0) 
-            error("ERROR on accept");
+        read_fds = master_fds;
 
-        int stdin_save = dup(STDIN_FILENO); // saved stdin for potential reset 
-        dup2(childfd,STDIN_FILENO); // set stdin to client socket 
+        /*
+         * select: wait for a socket to be ready
+         */
+        printf("Waiting for socket to be ready\n");
+        if (select(fdmax+1, &read_fds, NULL, NULL, NULL) < 0)
+            exit_failure("ERROR on select\n");
 
-        //start reading request from STDIN
-        if( fgets(line, sizeof(line), stdin)== (char*)0)
-            error("Failed to get Request");
-        //clean up and parse request
-        trim(line);
-        if(sscanf( line, "%[^ ] %[^ ] %[^ ]", method, url, protocol ) != 3 )
-            error("Failed to Parse Request");
-
-        //ensure http is lower case
-        strncpy( url, "http", 4 );
-        
-        update(cache);
-
-
-        //break apart the url and get host / path / port if they exist
-        //I referenced a few pages to help with this part including:
-        //https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
-
-        //if sscanf properly parses hostname into host buffer, a port number into accessport, 
-        // and the rest into path
-        if(sscanf( url, "http://%[^:/]:%d%s", host, &accessport, path)==3)
-            finport = (unsigned short) accessport;
-        //if no port is specified assume 80
-        else if (sscanf( url, "http://%[^:/]%s", host, path)==2)
-            finport = 80;
-
-
-        //Start building destination
-        //build the server's Internet address
-        struct addrinfo destaddr; //destinatrion addr
-        char portarray[10];
-        struct addrinfo* fullinfo;
-        struct sockaddr_in6 finsock;\
-        int sock_fam, sock_type, sock_prot, sock_len;
-        int serversock;
-        //initialize some values
-        memset(&destaddr, 0, sizeof (destaddr));
-        memset( (void*) &finsock, 0, sizeof(finsock) );
-
-        destaddr.ai_family = PF_UNSPEC;
-        destaddr.ai_socktype = SOCK_STREAM;
-        //copy port into array
-        snprintf( portarray, sizeof(portarray), "%d", (int) finport );
-        //perform lookup
-        if( (getaddrinfo(host, portarray, &destaddr, &fullinfo))!=0)
-            error("Bad address not found");
-
-        //loop through fulladdress info for ipv4 or ipv6 addresses
-        struct addrinfo* ipv4 = (struct addrinfo*) 0;
-        struct addrinfo* ipv6 = (struct addrinfo*) 0;
-        for(struct addrinfo* i =fullinfo; i != (struct addrinfo*) 0; i=i->ai_next)
+        for (sckt = 0; sckt <= fdmax; sckt++) 
         {
-            //switch on address info family type to match ipv4 vs 6
-            switch (i->ai_family)
+            if (!FD_ISSET(sckt, &read_fds))
+                continue;
+            
+            if (sckt == parentfd) 
             {
-            case AF_INET:
-                if(ipv4== (struct addrinfo*) 0)
-                    ipv4 = i;
-                break;
-            case AF_INET6:
-            if(ipv6== (struct addrinfo*) 0)
-                ipv6 = i;
-            break;
+                /* Incoming connection request */
+                childfd = accept(parentfd, (struct sockaddr *) &serveraddr, &addresslen);
+                if (childfd < 0) 
+                {
+                    fprintf(stderr, "ERROR on accept\n");
+                }
+                else
+                {
+                    FD_SET(childfd, &master_fds);
+                    fdmax = MAX(childfd, fdmax);
+                }
+            } 
+            else 
+            {
+                childfd = sckt;
+                /* Data arriving from already connected socket */
+                // int stdin_save = dup(STDIN_FILENO); // saved stdin for potential reset 
+                dup2(childfd,STDIN_FILENO); // set stdin to client socket 
+
+                //start reading request from STDIN
+                if( fgets(line, sizeof(line)-1, stdin)== (char*)0)
+                {
+                    fprintf(stderr, "Failed to get Request\n");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                    continue;
+                }
+                printf("Just got line %s\n", line);
+                //clean up and parse request
+                trim(line);
+                if(sscanf( line, "%[^ ] %[^ ] %[^ ]", method, url, protocol ) != 3 )
+                {
+                    printf("Line is: %s\n", line);
+                    fprintf(stderr, "Failed to Parse Request\n");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                    continue;
+                }
+
+                if(url[0] == '\0')
+                {
+                    fprintf(stderr, "Bad url on Request\n");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                    continue;
+                }
+                
+                update(cache);
+                if(strcmp(method, "GET") == 0 && strncasecmp(url, "http://", 7) == 0)
+                {
+                    memcpy( url, "http", 4 );
+
+                    if(sscanf( url, "http://%[^:/]:%d%s", host, &accessport, path)==3)
+                        finport = (unsigned short) accessport;
+                    //if no port is specified assume 80
+                    else if (sscanf( url, "http://%[^:/]%s", host, path)==2)
+                        finport = 80;
+                    /*
+                    else if (sscanf( url, "http://%[^:/]:%d", host, &accessport)==2)
+                    {
+                        finport = (unsigned short) accessport;
+                        *path = '\0';
+                    }
+                    else if (sscanf (url, "http://%[^/]", host)==1)
+                    {
+                        finport = 80;
+                        *path = '\0';
+                    }
+                    else
+                    {
+                        fprintf(stderr, "Could not sscanf on url\n");
+                        close(childfd);
+                        FD_CLR(childfd, &master_fds);
+                        continue;
+                    }*/
+                    https = 0;    
+                }
+                else if (strcmp(method, "CONNECT")==0) //check for https request
+                {
+                    if (sscanf(url, "%[^:]:%d", host, &accessport) ==2)
+                        finport = (unsigned short) accessport;
+                    else if (sscanf(url, "%s", host)==1)
+                        finport = 443;
+                    else
+                    {
+                        fprintf(stderr, "Failed to parse https url\n");
+                        close(childfd);
+                        FD_CLR(childfd, &master_fds);
+                        continue;
+                    }
+                    https = 1;
+                }
+                else
+                {
+                        fprintf(stderr, "Unsupported method\n");
+                        close(childfd);
+                        FD_CLR(childfd, &master_fds);
+                        continue;
+                }
+                
+
+                //break apart the url and get host / path / port if they exist
+                //I referenced a few pages to help with this part including:
+                //https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
+
+                //if sscanf properly parses hostname into host buffer, a port number into accessport, 
+                // and the rest into path
+
+
+                //Start building destination
+                //build the server's Internet address
+                struct addrinfo destaddr; //destinatrion addr
+                char portarray[10];
+                struct addrinfo* fullinfo;
+                struct sockaddr_in6 finsock;\
+                int sock_fam, sock_type, sock_prot, sock_len;
+                int serversock;
+                //initialize some values
+                memset(&destaddr, 0, sizeof (destaddr));
+                memset( (void*) &finsock, 0, sizeof(finsock) );
+
+                destaddr.ai_family = PF_UNSPEC;
+                destaddr.ai_socktype = SOCK_STREAM;
+                //copy port into array
+                snprintf( portarray, sizeof(portarray), "%d", (int) finport );
+                //perform lookup
+                if( (getaddrinfo(host, portarray, &destaddr, &fullinfo))!=0)
+                {
+                    fprintf(stderr, "Bad address not found");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                    freeaddrinfo(fullinfo);
+                    continue;
+                }
+
+                //loop through fulladdress info for ipv4 or ipv6 addresses
+                struct addrinfo* ipv4 = (struct addrinfo*) 0;
+                struct addrinfo* ipv6 = (struct addrinfo*) 0;
+                for(struct addrinfo* i =fullinfo; i != (struct addrinfo*) 0; i=i->ai_next)
+                {
+                    //switch on address info family type to match ipv4 vs 6
+                    switch (i->ai_family)
+                    {
+                    case AF_INET:
+                        if(ipv4== (struct addrinfo*) 0)
+                            ipv4 = i;
+                        break;
+                    case AF_INET6:
+                    if(ipv6== (struct addrinfo*) 0)
+                        ipv6 = i;
+                    break;
+                    }
+                }
+                //use ipv4 address if found
+                if(ipv4 !=(struct addrinfo*) 0)
+                {
+                    sock_fam = ipv4->ai_family;
+                    sock_type = ipv4->ai_socktype;
+                    sock_prot = ipv4->ai_protocol;
+                    sock_len = ipv4->ai_addrlen;
+                    memmove(&finsock, ipv4->ai_addr, sock_len);
+                }
+                //use ipv6
+                else
+                {
+                    sock_fam = ipv6->ai_family;
+                    sock_type = ipv6->ai_socktype;
+                    sock_prot = ipv6->ai_protocol;
+                    sock_len = ipv6->ai_addrlen;
+                    memmove(&finsock, ipv6->ai_addr, sock_len);
+                }
+
+                //now that final socket info is set up open socket to server
+                serversock = socket(sock_fam, sock_type, sock_prot);
+                if(serversock<0)
+                {
+                    fprintf(stderr, "Couldnt form server socket");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                    continue;
+                }
+                if( connect(serversock, (struct sockaddr*) &finsock, sock_len) <0) 
+                {
+                    fprintf(stderr, "Couldn't connect to server");
+                    close(childfd);
+                    FD_CLR(childfd, &master_fds);
+                    continue;
+                }
+
+                //Now client socket has been connected to server
+                //open read and write channels
+                
+                sockrfp = fdopen(serversock, "r");
+                sockwfp = fdopen(serversock, "w");
+                FILE* clientsock = fdopen(childfd, "w");
+                if(https)
+                {
+                    printf("Routting https!\n");
+                    printf("Url is: %s\n", url);
+                    relay_ssl(method, host, protocol, sockrfp, sockwfp, clientsock, cache, url);
+                    printf("Finished routing\n");
+                }
+                else
+                {
+                    printf("routing client\n");
+                    printf("url is: %s\n", url);
+                    relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url);
+                    printf("Finished routing\n");
+                }
+                /*
+                //flush input
+                while(fgets(line, sizeof(line), stdin) != (char*)0 )
+                {
+                    printf("Line is: %s\n", line);
+                }*/
+                freeaddrinfo(fullinfo);
+                close(serversock);
+                //dup2(stdin_save,STDIN_FILENO);
+                //close(childfd); // TODO: add support to keep-alive
+                //FD_CLR(childfd, &master_fds);
             }
         }
-        //use ipv4 address if found
-        if(ipv4 !=(struct addrinfo*) 0)
-        {
-            sock_fam = ipv4->ai_family;
-            sock_type = ipv4->ai_socktype;
-            sock_prot = ipv4->ai_protocol;
-            sock_len = ipv4->ai_addrlen;
-            memmove(&finsock, ipv4->ai_addr, sock_len);
-        }
-        //use ipv6
-        else
-        {
-            sock_fam = ipv6->ai_family;
-            sock_type = ipv6->ai_socktype;
-            sock_prot = ipv6->ai_protocol;
-            sock_len = ipv6->ai_addrlen;
-            memmove(&finsock, ipv6->ai_addr, sock_len);
-        }
-
-        //now that final socket info is set up open socket to server
-        serversock = socket(sock_fam, sock_type, sock_prot);
-        if(serversock<0)
-            error("Couldnt form server socket");
-        if( connect(serversock, (struct sockaddr*) &finsock, sock_len) <0) 
-            error("Couldn't connect to server");
-
-        //Now client socket has been connected to server
-        //open read and write channels
-        
-        sockrfp = fdopen(serversock, "r");
-        sockwfp = fdopen(serversock, "w");
-        FILE* clientsock = fdopen(childfd, "w");
-        relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url);
-        close(serversock);
-        close(childfd); 
     }//while loop
     
 }

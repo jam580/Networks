@@ -34,7 +34,7 @@ typedef struct blockstruct Block;
 Block* initBlock()
 {
     Block* b1 = malloc(sizeof(Block));
-    b1->Object = (char*) malloc(1024*10240);
+    b1->Object = NULL;
     b1->key = calloc(100, sizeof(char));
     b1->valid = 0;
     b1->firstline = calloc(1, sizeof(char));
@@ -365,22 +365,8 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         fflush(clientsock);
         
         strcat(buff,end);
-        //strcat(buff,"Connection: close\r\n");
-
-        //check for content
         size_t header_len = strlen(buff);
-        if(con_length != -1)
-        {
-            printf("We have %ld content\n", con_length);
-            for(i=0; i<con_length; i++)
-            {
-                hold = fgetc(sockrfp);
-                memcpy(buff + header_len + i, &hold, 1);// TODO: store partial messages in case buff is not big enough
-            }
-            write(fileno(clientsock), buff + header_len, con_length);
-        }
-        //flush content to client
-        fflush(clientsock);
+        //strcat(buff,"Connection: close\r\n");
 
         //Cache value - found should be -1
         for(int i =0; i< cache->sz;i++)
@@ -396,7 +382,22 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
 
         //found is the right index 
         cache->Entries[found]->valid=1;
-        memcpy(cache->Entries[found]->Object, buff, header_len + con_length);
+        FREE(cache->Entries[found]->Object);
+        cache->Entries[found]->Object = malloc(header_len + con_length);
+        memcpy(cache->Entries[found]->Object, buff, header_len);
+
+        //check for content
+        if(con_length != -1)
+        {
+            printf("We have %ld content\n", con_length);
+            for(i=0; i<con_length; i++)
+            {
+                hold = fgetc(sockrfp);
+                memcpy(cache->Entries[found]->Object + header_len + i, &hold, 1);
+                write(fileno(clientsock), &hold, 1);
+            }
+        }
+
         //update key to url
         strcpy(cache->Entries[found]->key, url);
         cache->Entries[found]->maxage=age;
@@ -424,7 +425,7 @@ int main(int argc, char **argv) {
     FILE* sockrfp; // read socket file 
     FILE* sockwfp;// write socket file 
     struct sockaddr_in serveraddr; // server's addr 
-    Cache* cache = initCache(10);
+    Cache* cache = initCache(100);
     fd_set master_fds;
     fd_set read_fds;
     int fdmax;

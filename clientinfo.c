@@ -10,6 +10,7 @@ ClientInfo ClientInfo_new(int socket)
     ci->socket = socket;
     ci->time_added = time(NULL);
     ci->keep_alive = true;
+    ci->timeout = KEEPALIVE_TIMEOUT;
     return ci;
 }
 

@@ -9,11 +9,17 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <signal.h>
+#include <ctype.h>
+#include <stdbool.h>
 #include "failure.h"
 #include "mem.h"
+#include "clientlist.h"
+#include "headerfieldslist.h"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+#define KEEPALIVE_TIMEOUT 10
 
 struct blockstruct
 {
@@ -174,8 +180,10 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
     long con_length =-1;
     long i;
     int found = -1; //bool to dictate cache hit
-    char* endptr;
+    char* endptr, *obj, *obj_tmp;
     double age;
+    HeaderFieldsList header_fields;
+    bool keepalive = true;
 
     //look for cache hit
     update(cache);
@@ -184,13 +192,24 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
     //if there is a cache hit
     if(found!=-1)
     {
-        fprintf(clientsock, "%s",cache->Entries[found]->firstline);
-        fflush(clientsock);
+        printf("Cache hit\n");
+        obj = cache->Entries[found]->Object;
+        while(strncmp(obj, "\r\n", 2) != 0)
+        {
+            if (strncasecmp(obj, "Content-Length:", 15) == 0)
+                con_length=atol( &(obj[15]));
+            obj_tmp = strchr(obj, '\n') + 1;
+
+            for (; obj != obj_tmp; obj++) // send line
+                fputc(*obj, clientsock);
+        }
         long currentage = (long) time(NULL) - (long) cache->Entries[found]->intime;
-        fprintf(clientsock, "Age: %ld \n",currentage);
+        fprintf(clientsock, "Age: %ld \r\n\r\n",currentage);
         fflush(clientsock);
-        fprintf(clientsock, "%s", cache->Entries[found]->Object);
-        fflush(clientsock);
+        obj += 2; // blank new line
+
+        if(con_length != -1)
+            write(fileno(clientsock), obj, con_length);
 
         //now that we've sent the item, move it to front of cache
         Block* temp = cache->Entries[found];
@@ -205,25 +224,80 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
                 break;
             if( strncasecmp(line, "Content-Length:", 15) ==0)
                 con_length=atol( &(line[15]));
+            else
+                con_length = -1;
         }
         if(con_length !=-1)
             for(i=0; i<con_length && (hold = getchar())!= EOF; i++ );
     }//end of cache hit
     else
     {
+        header_fields = HeaderFieldsList_new();
         //First send http request, add back the \r\n
         fprintf(sockwfp, "%s %s %s\r\n", method, path, protocol);
         //make sure all info is sent
-        while(fgets(line, sizeof(line), stdin) != (char*)0 )
+        while(fgets(line, sizeof(line), stdin) != NULL)
         {
             //printf("Next line is: %s\n", line);
             if( strcmp( line, "\n" ) == 0 || strcmp( line, "\r\n" ) == 0 )
                 break;
-            fputs(line, sockwfp);
-            trim(line);
-            if( strncasecmp(line, "Content-Length:", 15) ==0)
-                con_length=atol( &(line[15]));
+            header_fields = HeaderFieldsList_push(header_fields, line);
         }
+
+        // Check for Connection
+        char *field = HeaderFieldsList_get(header_fields, "Connection");
+        if (field != NULL)
+        {
+            printf("Connection header found -- %s", field);
+            int start = 12, stop;
+            char tmp;
+            bool more_directives = true;
+            while (more_directives)
+            {
+                printf("getting directives -- %s", field + start);
+                while (field[start] == ' ')
+                    start++;
+                stop = start;
+                while (field[stop] != ',' && field[stop] != '\r' &&
+                    field[stop] != '\n')
+                    stop++;
+                if (field[stop] != ',')
+                    more_directives = false;
+                tmp = field[stop];
+                field[stop] = '\0';
+                if (strncasecmp("close", field+start, stop-start) == 0)
+                {
+                    // TODO do not persist
+                    field[stop] = tmp;
+                    keepalive = false;
+                    break;
+                }
+                if (strncasecmp("Keep-Alive", 
+                                field + start, stop-start) == 0) 
+                {
+                    // TODO get Keep-Alive header options
+                    printf("is keep-alive\n");
+                }
+
+                header_fields = HeaderFieldsList_remove(header_fields, 
+                                                            field + start);
+                field[stop] = tmp;
+                start = stop+1;
+            }
+            memcpy(field + 12, "close\r\n", 8);
+        }
+
+        header_fields = HeaderFieldsList_pop(header_fields, &field);
+        while(field != NULL)
+        {
+            fputs(field, sockwfp);
+            trim(field);
+            if( strncasecmp(field, "Content-Length:", 15) ==0)
+                con_length=atol( &(field[15]));
+            FREE(field);
+            header_fields = HeaderFieldsList_pop(header_fields, &field);
+        }
+        
         // flush to make sure all forwarded
         fputs(line, sockwfp);
         fflush(sockwfp);
@@ -261,6 +335,13 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
             }
             else
             {
+                if (strncasecmp(line, "Connection:", 11)==0)
+                {
+                    if (keepalive)
+                        memcpy(line, "Connection: keep-alive\r\n", 25);
+                    else
+                        memcpy(line, "Connection: close\r\n", 20);
+                }
                 strcat(buff,line);
                 fprintf(clientsock, "%s", line);
                 fflush(clientsock);
@@ -287,18 +368,16 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         //strcat(buff,"Connection: close\r\n");
 
         //check for content
+        size_t header_len = strlen(buff);
         if(con_length != -1)
         {
             printf("We have %ld content\n", con_length);
             for(i=0; i<con_length; i++)
             {
                 hold = fgetc(sockrfp);
-                //fputc(hold,clientsock);
-                //fflush(clientsock);
-                strncat(buff,&hold,1); // TODO: store partial messages in case buff is not big enough
-                fprintf(clientsock,"%c", hold);
-                
+                memcpy(buff + header_len + i, &hold, 1);// TODO: store partial messages in case buff is not big enough
             }
+            write(fileno(clientsock), buff + header_len, con_length);
         }
         //flush content to client
         fflush(clientsock);
@@ -317,7 +396,7 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
 
         //found is the right index 
         cache->Entries[found]->valid=1;
-        strcpy(cache->Entries[found]->Object, buff);
+        memcpy(cache->Entries[found]->Object, buff, header_len + con_length);
         //update key to url
         strcpy(cache->Entries[found]->key, url);
         cache->Entries[found]->maxage=age;
@@ -327,6 +406,7 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         //value is now cached
         FREE(firstlen);
         FREE(buff);
+        HeaderFieldsList_free(&header_fields);
     }//end of cache miss   
 }
 
@@ -349,6 +429,7 @@ int main(int argc, char **argv) {
     fd_set read_fds;
     int fdmax;
     int sckt; // looping variable
+    ClientList clients;
 
     //check command line arguments 
     if (argc != 2) {
@@ -400,6 +481,8 @@ int main(int argc, char **argv) {
 
     signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE
 
+    clients = ClientList_new();
+
     /***************************************************
      ****** main loop to handle socket connections******
      ***************************************************/
@@ -422,6 +505,7 @@ int main(int argc, char **argv) {
             if (sckt == parentfd) 
             {
                 /* Incoming connection request */
+                printf("Accepting new connection\n");
                 childfd = accept(parentfd, (struct sockaddr *) &serveraddr, &addresslen);
                 if (childfd < 0) 
                 {
@@ -431,6 +515,7 @@ int main(int argc, char **argv) {
                 {
                     FD_SET(childfd, &master_fds);
                     fdmax = MAX(childfd, fdmax);
+                    clients = ClientList_push(clients, childfd);
                 }
             } 
             else 
@@ -446,6 +531,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Failed to get Request\n");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    clients = ClientList_remove(clients, childfd);
                     continue;
                 }
                 printf("Just got line %s\n", line);
@@ -457,6 +543,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Failed to Parse Request\n");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    clients = ClientList_remove(clients, childfd);
                     continue;
                 }
 
@@ -465,6 +552,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Bad url on Request\n");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    clients = ClientList_remove(clients, childfd);
                     continue;
                 }
                 
@@ -509,15 +597,17 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "Failed to parse https url\n");
                         close(childfd);
                         FD_CLR(childfd, &master_fds);
+                        clients = ClientList_remove(clients, childfd);
                         continue;
                     }
                     https = 1;
                 }
-                else
+                else // TODO: Add support for POST
                 {
                         fprintf(stderr, "Unsupported method\n");
                         close(childfd);
                         FD_CLR(childfd, &master_fds);
+                        clients = ClientList_remove(clients, childfd);
                         continue;
                 }
                 
@@ -552,6 +642,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Bad address not found");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    clients = ClientList_remove(clients, childfd);
                     freeaddrinfo(fullinfo);
                     continue;
                 }
@@ -600,6 +691,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Couldnt form server socket");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    clients = ClientList_remove(clients, childfd);
                     continue;
                 }
                 if( connect(serversock, (struct sockaddr*) &finsock, sock_len) <0) 
@@ -607,6 +699,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Couldn't connect to server");
                     close(childfd);
                     FD_CLR(childfd, &master_fds);
+                    clients = ClientList_remove(clients, childfd);
                     continue;
                 }
 
@@ -641,10 +734,12 @@ int main(int argc, char **argv) {
                 //dup2(stdin_save,STDIN_FILENO);
                 //close(childfd); // TODO: add support to keep-alive
                 //FD_CLR(childfd, &master_fds);
+                //clients = ClientList_remove(clients, childfd);
             }
         }
     }//while loop
-    
+
+    ClientList_free(&clients);   
 }
 
 

@@ -1,3 +1,16 @@
+/*******************************************************************************
+*
+* Tufts University
+* COMP112 (Networks) - Final Project
+* By: Ramon Fernandes & James Mattei
+* Last Edited: December 2, 2020
+*                               
+* server.c - main processor for an HTTP proxy server application
+* Command Arguments:
+*      port: port to listen on for incoming connections
+*
+*******************************************************************************/
+
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -11,6 +24,7 @@
 #include <signal.h>
 #include <ctype.h>
 #include <stdbool.h>
+#include <assert.h>
 #include "failure.h"
 #include "mem.h"
 #include "clientlist.h"
@@ -140,6 +154,13 @@ void process_keep_alive(ClientList cl, FILE *clientsock, char *keep_alive)
     }
 }
 
+void flush_socket(int sckt, char *buf, int bytes)
+{
+    // check bytes for content-length
+
+    // if there's content-length,
+}
+
 static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, FILE* sockwfp, FILE * clientsock, Cache* cache, char*url)
 {
     int client_read, server_read, client_write, server_write;
@@ -210,7 +231,7 @@ static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, F
     }
 }
 
-static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, FILE* sockwfp, FILE* clientsock, Cache* cache, char* url, ClientList cl)
+static void relay_http(char* method, char* path, char* protocol, int serverfd, int clientfd, Cache* cache, char* url, ClientList cl, char *buf, int bytes)
 {
     char line[10000], prot[10000], coms[10000];
     int first_line, stat;
@@ -237,17 +258,14 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
             if (strncasecmp(obj, "Content-Length:", 15) == 0)
                 con_length=atol( &(obj[15]));
             obj_tmp = strchr(obj, '\n') + 1;
-
-            for (; obj != obj_tmp; obj++) // send line
-                fputc(*obj, clientsock);
+            write(clientfd, obj, obj_tmp - obj + 1); // write line
         }
         long currentage = (long) time(NULL) - (long) cache->Entries[found]->intime;
-        fprintf(clientsock, "Age: %ld \r\n\r\n",currentage);
-        fflush(clientsock);
+        write(clientfd, "Age: %ld \r\n\r\n", 13);
         obj += 2; // blank new line
 
         if(con_length != -1)
-            write(fileno(clientsock), obj, con_length);
+            write(clientfd, obj, con_length);
 
         //now that we've sent the item, move it to front of cache
         Block* temp = cache->Entries[found];
@@ -478,7 +496,102 @@ void close_client(ClientList *clients, fd_set *master_fds, int socket)
     *clients = ClientList_remove(*clients, socket);
 }
 
-int main(int argc, char **argv) {
+void check_usage(int argc, const char* argv[])
+{
+    if (argc != 2) 
+    {
+        // need to add 2 for extra space around %s and for the null terminator.
+        int buffer_size = strlen("Usage: %s <port>\n") + strlen(argv[0]) + 2;
+        char msg[buffer_size];
+        sprintf(msg, "Usage: %s <port>\n", argv[0]);
+        exit_failure(msg);
+    }
+}
+
+int strcpy_until(char *src, char *dest, int start, int max, char delim)
+{
+    int j = 0;
+    while (src[start] != delim && start < max)
+    {
+        memcpy(dest + j, src + start, 1);
+        start++;
+        j++;
+    }
+    dest[j] = '\0';
+
+    return j;
+}
+
+/*
+ * Split the start line in buf into the method, the request-target, and the 
+ * protocol version. More info in RFC 7230, pg. 21. Reads for max bytes given.
+ * 
+ * Returns true if successfully parsed or false otherwise.
+ * 
+ * // TODO: currently this assumes properly formatted start line
+ */
+bool explode_start_line(char *buf, char *method, char *url, 
+    char *protocol, int bytes)
+{
+    assert(buf);
+    int i = 0, copied;
+
+    i += strcpy_until(buf, method, i, bytes, ' ');
+    if (i >= bytes)
+        return false;
+
+    i += strcpy_until(buf, url, ++i, bytes, ' ');
+    if (i >= bytes)
+        return false;
+
+    copied = strcpy_until(buf, protocol, ++i, bytes, '\n');
+    if (i + copied >= bytes)
+        return false;
+    if (protocol[copied - 1] == '\r')
+        protocol[copied - 1] = '\0';
+
+    return true;
+}
+
+/*
+ * Break apart the url into host, path, and port if they exist.
+ * References: https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
+ * 
+ * Returns true if successfully parsed or false otherwise.
+ * 
+ * // TODO: currently this assumes properly formatted start line
+ */
+bool explode_url(char *url, char *host, int *port, char *path)
+{
+    if (sscanf(url, "http://%[^:]:%d%s", host, port, path) == 3 ||
+        sscanf(url, "https://%[^:]:%d%s", host, port, path) == 3)
+    {
+        // do nothing
+    }
+    else if (sscanf(url, "http://%[^:/]%s", host, path) == 2 ||
+             sscanf(url, "https://%[^:/]%s", host, path) == 2)
+    {
+        *port = -1;
+    }
+    /*
+    else if (sscanf( url, "http://%[^:/]:%d", host, &accessport)==2)
+    {
+        finport = (unsigned short) accessport;
+        *path = '\0';
+    }
+    else if (sscanf (url, "http://%[^/]", host)==1)
+    {
+        finport = 80;
+        *path = '\0';
+    }*/
+    else
+    {
+        return false;
+    }
+    return true;
+}
+
+int main(int argc, const char **argv) {
     //Arrays to be used for HTTP header
     char line[10000], method[10000], url[10000], protocol[10000], host[10000], path[10000];
     int parentfd; // parent socket 
@@ -498,19 +611,15 @@ int main(int argc, char **argv) {
     int fdmax;
     int sckt; // looping variable
     ClientList clients;
+    int bytes;
 
-    //check command line arguments 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
-        exit(1);
-    }
+    check_usage(argc, argv);
     portno = atoi(argv[1]);
-
     
     // socket: create the parent socket 
     parentfd = socket(AF_INET, SOCK_STREAM, 0);
     if (parentfd < 0) 
-        error("ERROR opening socket");
+        exit_failure("ERROR opening socket\n");
 
     //command to kill the server and avoid "already in use error"
     //taken from example server
@@ -531,13 +640,13 @@ int main(int argc, char **argv) {
     //bind: associate the parent socket with a port 
     if (bind(parentfd, (struct sockaddr *) &serveraddr, 
         sizeof(serveraddr)) < 0) 
-        error("ERROR on binding");
+        exit_failure("ERROR on binding\n");
 
     /* 
     * listen: make this socket ready to accept connection requests 
     */
     if (listen(parentfd, 5) < 0) // allow 5 requests to queue up  
-        error("ERROR on listen");
+        exit_failure("ERROR on listen\n");
 
     /*
      * Clear memory in fdsets
@@ -594,28 +703,23 @@ int main(int argc, char **argv) {
             {
                 childfd = sckt;
                 /* Data arriving from already connected socket */
-                // int stdin_save = dup(STDIN_FILENO); // saved stdin for potential reset 
-                dup2(childfd,STDIN_FILENO); // set stdin to client socket 
 
-                //start reading request from STDIN
-                if( fgets(line, sizeof(line)-1, stdin)== (char*)0)
+                if ((bytes = read(sckt, line, sizeof(line)-1)) <= 0)
                 {
-                    fprintf(stderr, "Failed to get Request\n");
+                    fprintf(stderr, "Failed to read\n");
                     close_client(&clients, &master_fds, childfd);
                     continue;
                 }
-                printf("Just got line %s\n", line);
-                //clean up and parse request
-                trim(line);
-                if(sscanf( line, "%[^ ] %[^ ] %[^ ]", method, url, protocol ) != 3 )
+
+                if (!explode_start_line(line, method, url, protocol, bytes))
                 {
-                    printf("Line is: %s\n", line);
+                    printf("Request is: %s\n", line);
                     fprintf(stderr, "Failed to Parse Request\n");
                     close_client(&clients, &master_fds, childfd);
                     continue;
                 }
 
-                if(url[0] == '\0')
+                if(url[0] == '\0') // TODO: why is this necessary?
                 {
                     fprintf(stderr, "Bad url on Request\n");
                     close_client(&clients, &master_fds, childfd);
@@ -625,41 +729,24 @@ int main(int argc, char **argv) {
                 update(cache);
                 if(strcmp(method, "GET") == 0 && strncasecmp(url, "http://", 7) == 0)
                 {
-                    memcpy( url, "http", 4 );
-
-                    if(sscanf( url, "http://%[^:/]:%d%s", host, &accessport, path)==3)
-                        finport = (unsigned short) accessport;
-                    //if no port is specified assume 80
-                    else if (sscanf( url, "http://%[^:/]%s", host, path)==2)
-                        finport = 80;
-                    /*
-                    else if (sscanf( url, "http://%[^:/]:%d", host, &accessport)==2)
+                    if(!explode_url(url, host, &accessport, path))
                     {
-                        finport = (unsigned short) accessport;
-                        *path = '\0';
-                    }
-                    else if (sscanf (url, "http://%[^/]", host)==1)
-                    {
-                        finport = 80;
-                        *path = '\0';
-                    }
-                    else
-                    {
-                        fprintf(stderr, "Could not sscanf on url\n");
+                        fprintf(stderr, "Failed to parse url\n");
                         close_client(&clients, &master_fds, childfd);
                         continue;
-                    }*/
+                    }
+                    if (accessport == -1)
+                        finport = 80;
+                    else
+                        finport = (unsigned short) accessport;
+                    
                     https = 0;    
                 }
                 else if (strcmp(method, "CONNECT")==0) //check for https request
                 {
-                    if (sscanf(url, "%[^:]:%d", host, &accessport) ==2)
-                        finport = (unsigned short) accessport;
-                    else if (sscanf(url, "%s", host)==1)
-                        finport = 443;
-                    else
+                    if(!explode_url(url, host, &accessport, path))
                     {
-                        fprintf(stderr, "Failed to parse https url\n");
+                        fprintf(stderr, "Failed to parse url\n");
                         close_client(&clients, &master_fds, childfd);
                         continue;
                     }
@@ -671,22 +758,13 @@ int main(int argc, char **argv) {
                         close_client(&clients, &master_fds, childfd);
                         continue;
                 }
-                
-
-                //break apart the url and get host / path / port if they exist
-                //I referenced a few pages to help with this part including:
-                //https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
-
-                //if sscanf properly parses hostname into host buffer, a port number into accessport, 
-                // and the rest into path
-
 
                 //Start building destination
                 //build the server's Internet address
                 struct addrinfo destaddr; //destinatrion addr
                 char portarray[10];
                 struct addrinfo* fullinfo;
-                struct sockaddr_in6 finsock;\
+                struct sockaddr_in6 finsock;
                 int sock_fam, sock_type, sock_prot, sock_len;
                 int serversock;
                 //initialize some values
@@ -700,7 +778,7 @@ int main(int argc, char **argv) {
                 //perform lookup
                 if( (getaddrinfo(host, portarray, &destaddr, &fullinfo))!=0)
                 {
-                    fprintf(stderr, "Bad address not found");
+                    fprintf(stderr, "Bad address not found\n");
                     close_client(&clients, &master_fds, childfd);
                     freeaddrinfo(fullinfo);
                     continue;
@@ -747,16 +825,17 @@ int main(int argc, char **argv) {
                 serversock = socket(sock_fam, sock_type, sock_prot);
                 if(serversock<0)
                 {
-                    fprintf(stderr, "Couldnt form server socket");
+                    fprintf(stderr, "Couldn't form server socket\n");
                     close_client(&clients, &master_fds, childfd);
                     continue;
                 }
                 if( connect(serversock, (struct sockaddr*) &finsock, sock_len) <0) 
                 {
-                    fprintf(stderr, "Couldn't connect to server");
+                    fprintf(stderr, "Couldn't connect to server\n");
                     close_client(&clients, &master_fds, childfd);
                     continue;
                 }
+                exit(EXIT_FAILURE);
 
                 //Now client socket has been connected to server
                 //open read and write channels
@@ -775,18 +854,12 @@ int main(int argc, char **argv) {
                 {
                     printf("routing client\n");
                     printf("url is: %s\n", url);
-                    relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url, clients);
+                    relay_http(method, path, protocol, serversock, childfd, cache, url, clients, line, bytes);
                     printf("Finished routing\n");
                 }
-                /*
-                //flush input
-                while(fgets(line, sizeof(line), stdin) != (char*)0 )
-                {
-                    printf("Line is: %s\n", line);
-                }*/
+
                 freeaddrinfo(fullinfo);
                 close(serversock);
-                //dup2(stdin_save,STDIN_FILENO);
             }
         }
     }//while loop

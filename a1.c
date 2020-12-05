@@ -33,6 +33,8 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+#define BUFF_SIZE 10000
+
 struct blockstruct
 {
     char* Object;
@@ -119,7 +121,7 @@ int find(char* url, Cache* cache)
  * Processes the given Keep-Alive header and stores relevant information in
  * client info. A NULL keep_alive does not alter the existing keep_alive config.
  */
-void process_keep_alive(ClientList cl, FILE *clientsock, char *keep_alive)
+void process_keep_alive(ClientList cl, int clientsock, char *keep_alive)
 {
     int start, stop, timeout;
     bool more_directives;
@@ -146,7 +148,7 @@ void process_keep_alive(ClientList cl, FILE *clientsock, char *keep_alive)
             tmp = keep_alive[stop];
             keep_alive[stop] = '\0';
             timeout = atoi(keep_alive + start + 8);
-            ClientList_set_keepalive(cl, fileno(clientsock), true, timeout);
+            ClientList_set_keepalive(cl, clientsock, true, timeout);
             keep_alive[stop] = tmp;
             break;
         }
@@ -154,11 +156,93 @@ void process_keep_alive(ClientList cl, FILE *clientsock, char *keep_alive)
     }
 }
 
-void flush_socket(int sckt, char *buf, int bytes)
+bool process_header_buf(char *buf, int *bytes, HeaderFieldsList *hf)
 {
-    // check bytes for content-length
+    int i;
+    char *new_buf, *line;
+    bool end_of_header;
 
-    // if there's content-length,
+    i = 0;
+    new_buf = buf;
+    end_of_header = false;
+    while (i < *bytes && !end_of_header)
+    {
+        if (*new_buf != '\n') // keep searching until end of line
+        {
+            // do nothing
+        }
+        else if (strncmp(buf, "\r\n", 2) == 0) // last line
+        {
+            end_of_header = true;
+            buf = new_buf + 1;
+        }
+        else
+        {
+            line = calloc(new_buf - buf + 2, sizeof(*line));
+            memcpy(line, buf, new_buf - buf + 1);
+            *hf = HeaderFieldsList_push(*hf, line);
+            FREE(line);
+            buf = new_buf + 1;
+        }
+        
+        i++;
+        new_buf++;
+    }
+
+    if (i == *bytes)
+    {
+        *bytes = 0;
+        buf = NULL;
+    }
+    else
+    {
+        *bytes = new_buf - buf;
+        buf = buf + i;
+    }
+
+    return end_of_header;
+}
+
+HeaderFieldsList read_header(int sckt, char *buf, int *bytes)
+{
+    HeaderFieldsList header_fields;
+    int i, new_bytes;
+    char *new_buf;
+    bool first_line_read, end_of_header;
+
+    header_fields = HeaderFieldsList_new();
+    i = 0;
+    new_buf = buf;
+    first_line_read = false;
+    end_of_header = false;
+
+    // skip over first line
+    while (i < *bytes && !first_line_read)
+    {
+        if (*new_buf == '\n')
+            first_line_read = true;
+        i++;
+        new_buf++;
+    }
+
+    new_buf = calloc(BUFF_SIZE, sizeof(*new_buf));
+    *bytes = *bytes - i; 
+    buf = buf + i;
+    if (i != *bytes)
+        end_of_header = process_header_buf(buf, bytes, &header_fields);
+
+    while (!end_of_header)
+    {
+        if (buf != NULL)
+            memcpy(new_buf, buf, *bytes);
+        new_bytes = read(sckt, new_buf + *bytes, BUFF_SIZE);
+        end_of_header = process_header_buf(new_buf, &new_bytes, &header_fields);
+    }
+
+    buf = new_buf;
+    *bytes = new_bytes;
+
+    return header_fields;
 }
 
 static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, FILE* sockwfp, FILE * clientsock, Cache* cache, char*url)
@@ -234,13 +318,13 @@ static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, F
 static void relay_http(char* method, char* path, char* protocol, int serverfd, int clientfd, Cache* cache, char* url, ClientList cl, char *buf, int bytes)
 {
     char line[10000], prot[10000], coms[10000];
-    int first_line, stat;
+    int first_line, stat, new_bytes;
     char hold;
     long con_length =-1;
     long i;
     int found = -1; //bool to dictate cache hit
     char* endptr, *obj, *obj_tmp;
-    double age;
+    int age;
     HeaderFieldsList header_fields;
     bool keepalive = true;
 
@@ -258,14 +342,14 @@ static void relay_http(char* method, char* path, char* protocol, int serverfd, i
             if (strncasecmp(obj, "Content-Length:", 15) == 0)
                 con_length=atol( &(obj[15]));
             obj_tmp = strchr(obj, '\n') + 1;
-            write(clientfd, obj, obj_tmp - obj + 1); // write line
+            new_bytes = write(clientfd, obj, obj_tmp - obj + 1); // write line
         }
         long currentage = (long) time(NULL) - (long) cache->Entries[found]->intime;
-        write(clientfd, "Age: %ld \r\n\r\n", 13);
+        new_bytes = write(clientfd, "Age: %ld \r\n\r\n", currentage);
         obj += 2; // blank new line
 
         if(con_length != -1)
-            write(clientfd, obj, con_length);
+            new_bytes = write(clientfd, obj, con_length);
 
         //now that we've sent the item, move it to front of cache
         Block* temp = cache->Entries[found];
@@ -273,34 +357,28 @@ static void relay_http(char* method, char* path, char* protocol, int serverfd, i
             cache->Entries[i]=cache->Entries[i-1];
         cache->Entries[0]=temp;
         temp=NULL;
+
         //flush the remainder of the client request
-        while(fgets(line, sizeof(line), stdin) != (char*)0 )
+        header_fields = read_header(clientfd, buf, &bytes);
+        char *field = HeaderFieldsList_get(header_fields, "Content-Length");
+        
+        if (field != NULL)
         {
-            if( strcmp( line, "\n" ) == 0 || strcmp( line, "\r\n" ) == 0 )
-                break;
-            if( strncasecmp(line, "Content-Length:", 15) ==0)
-                con_length=atol( &(line[15]));
-            else
-                con_length = -1;
+            con_length = atol(field + 15);
+            new_bytes = 1;
+            for(i = 0; i < con_length && bytes == 1; i++)
+                new_bytes = read(clientfd, &hold, 1);
         }
-        if(con_length !=-1)
-            for(i=0; i<con_length && (hold = getchar())!= EOF; i++ );
     }//end of cache hit
     else
     {
+        printf("Not in cache\n");
         header_fields = HeaderFieldsList_new();
         //First send http request, add back the \r\n
-        fprintf(sockwfp, "%s %s %s\r\n", method, path, protocol);
-        //make sure all info is sent
-        while(fgets(line, sizeof(line), stdin) != NULL)
-        {
-            //printf("Next line is: %s\n", line);
-            if( strcmp( line, "\n" ) == 0 || strcmp( line, "\r\n" ) == 0 )
-                break;
-            header_fields = HeaderFieldsList_push(header_fields, line);
-        }
-
-        // Check for Connection // TODO: Check for HTTP/1.0. DO NOT PERSIST
+        new_bytes = write(serverfd, buf, strchr(buf, '\n') - buf + 1);
+        header_fields = read_header(clientfd, buf, &bytes);
+        printf("Finished reading header\n");
+        // Check for Connection
         char *field = HeaderFieldsList_get(header_fields, "Connection");
         if (field != NULL)
         {
@@ -312,7 +390,7 @@ static void relay_http(char* method, char* path, char* protocol, int serverfd, i
             if (strncasecmp(protocol, "HTTP/1.0", 8) == 0)
             {
                 // Proxies are not allowed to persist connections with 1.0 clients (RFC 7230 pg. 53)
-                ClientList_set_keepalive(cl, fileno(clientsock), false, -1);
+                ClientList_set_keepalive(cl, clientfd, false, -1);
                 keepalive = false;
             }
             else 
@@ -331,14 +409,14 @@ static void relay_http(char* method, char* path, char* protocol, int serverfd, i
                     
                     if (strncasecmp("close", field+start, stop-start) == 0)
                     {
-                        ClientList_set_keepalive(cl, fileno(clientsock), false, -1);
+                        ClientList_set_keepalive(cl, clientfd, false, -1);
                         keepalive = false;
                         break;
                     }
                     if (strncasecmp("Keep-Alive", 
                                     field + start, stop-start) == 0) 
                     {
-                        process_keep_alive(cl, clientsock, 
+                        process_keep_alive(cl, clientfd, 
                             HeaderFieldsList_get(header_fields, "Keep-Alive"));
                         printf("is keep-alive\n");
                     }
@@ -358,34 +436,38 @@ static void relay_http(char* method, char* path, char* protocol, int serverfd, i
             if (strncasecmp(protocol, "HTTP/1.0", 8) == 0)
             {
                 // Proxies are not allowed to persist connections with 1.0 clients (RFC 7230 pg. 53)
-                ClientList_set_keepalive(cl, fileno(clientsock), false, -1);
+                ClientList_set_keepalive(cl, clientfd, false, -1);
                 keepalive = false;
             }
             HeaderFieldsList_push(header_fields, "Connection: close\r\n");
         }
 
         header_fields = HeaderFieldsList_pop(header_fields, &field);
-        while(field != NULL)
+        new_bytes = 1;
+        while(field != NULL && new_bytes > 0)
         {
-            fputs(field, sockwfp);
-            trim(field);
+            new_bytes = write(serverfd, field, strlen(field));
             if( strncasecmp(field, "Content-Length:", 15) ==0)
                 con_length=atol( &(field[15]));
             FREE(field);
             header_fields = HeaderFieldsList_pop(header_fields, &field);
         }
+        new_bytes = write(serverfd, "\r\n", 2);
         
-        // flush to make sure all forwarded
-        fputs(line, sockwfp); // this is the blank new line.
-        fflush(sockwfp);
         //check for content and flush every char
         if(con_length !=-1)
         {
-            for(i=0; i<con_length && (hold = getchar())!= EOF; i++ )
-                putc(hold, sockwfp);
+            for(i=0; i<con_length; i++ )
+            {
+                if (bytes - i > 0)
+                    new_bytes = write(serverfd, buf + i, 1);
+                else
+                {
+                    read(clientfd, buf, 1);
+                    write(serverfd, buf, 1);
+                }
+            }
         }
-        
-        fflush(sockwfp);
 
         //recieve response form server and forward to client
         char* buff = calloc(1024*1024, sizeof(char));
@@ -394,53 +476,85 @@ static void relay_http(char* method, char* path, char* protocol, int serverfd, i
         stat = -1;
         int cacheage = 0;
         char* firstlen;
-        while( fgets(line, sizeof(line), sockrfp)!= (char*) 0)
+
+        bytes = read(serverfd, buff, 1024*1024);
+        header_fields = read_header(serverfd, buff, &bytes);
+        field = HeaderFieldsList_get(header_fields, "Connection");
+        if (field != NULL)
         {
-            //printf("Newline inside relayhttp: %s\n", line);
-            
-            if( strcmp(line, "\n") ==0 || strcmp(line, "\r\n") ==0 )
-                break;
-            if( first_line)
-            {
-                firstlen = strdup(line);
-                fprintf(clientsock, "%s", line);
-                fflush(clientsock);
-                strcpy(buff, line);
-                trim(line);
-                sscanf(line, "%[^ ] %d %s", prot, &stat, coms);
-                first_line=0;
-            }
+            if (keepalive)
+                memcpy(field + 12, "keep-alive\r\n", 13);
             else
+                memcpy(field + 12, "close\r\n", 8);
+        }
+        else
+        {
+            if (keepalive)
+                header_fields = HeaderFieldsList_push(
+                                    header_fields, 
+                                    "Connection: keep-alive\r\n");
+            else
+                header_fields = HeaderFieldsList_push(
+                                    header_fields, 
+                                    "Connection: close\r\n");
+        }
+
+        field = HeaderFieldsList_get(header_fields, "Content-Length");
+        if (field != NULL)
+            con_length = atol(field + 15);
+        
+        field = HeaderFieldsList_get(header_fields, "Cache-Control:");
+        if (field != NULL)
+        {
+            int start = 12, stop;
+            bool more_directives = true;
+            while (more_directives)
             {
-                if (strncasecmp(line, "Connection:", 11)==0)
+                while(field[start] == ' ')
+                    start++;
+                stop = start;
+                while (field[stop] != ',' && field[stop] != '\r' && field[stop] != '\n')
+                    stop++;
+                if (field[stop] != ',')
+                    more_directives = false;
+
+                if (strncasecmp("max-age", field+start, stop-start) == 0)
                 {
-                    if (keepalive)
-                        memcpy(line, "Connection: keep-alive\r\n", 25);
-                    else
-                        memcpy(line, "Connection: close\r\n", 20);
-                }
-                strcat(buff,line);
-                fprintf(clientsock, "%s", line);
-                fflush(clientsock);
-                trim( line);
-                
-                if (strncasecmp(line, "Content-Length:",15)==0)
-                    con_length = atol( &(line[15]));
-                if (strncasecmp(line, "Cache-Control: max-age=",23)==0)
-                {
-                    age = strtod(&(line[23]), &endptr);
+                    age = atoi(line + start + 8);
                     cacheage = 1;
                 }
-            }    
-        } //end of reading headers
+                start = stop+1;
+            }
+        }
+
+        header_fields = HeaderFieldsList_pop(header_fields, &field);
+        new_bytes = 1;
+        while(field != NULL && new_bytes > 0)
+        {
+            new_bytes = write(clientfd, field, strlen(field));
+            FREE(field);
+            header_fields = HeaderFieldsList_pop(header_fields, &field);
+        }
+        new_bytes = write(clientfd, "\r\n", 2);
+
         if(!cacheage)
             age = 3600;
-        //Add the end of the header
-        char* end = "\r\n";
-        //fprintf(clientsock, "%s", end); 
-        fprintf(clientsock, "%s", end);
-        fflush(clientsock);
-        
+
+        //check for content
+        if(con_length != -1)
+        {
+            printf("We have %ld content\n", con_length);
+            for(i=0; i<con_length; i++)
+            {
+                new_bytes = read(serverfd, &hold, 1);
+                //memcpy(cache->Entries[found]->Object + header_len + i, &hold, 1);
+                write(clientfd, &hold, 1);
+            }
+        }
+        FREE(buff);
+
+
+        /*
         strcat(buff,end);
         size_t header_len = strlen(buff);
         //strcat(buff,"Connection: close\r\n");
@@ -463,18 +577,6 @@ static void relay_http(char* method, char* path, char* protocol, int serverfd, i
         cache->Entries[found]->Object = malloc(header_len + con_length);
         memcpy(cache->Entries[found]->Object, buff, header_len);
 
-        //check for content
-        if(con_length != -1)
-        {
-            printf("We have %ld content\n", con_length);
-            for(i=0; i<con_length; i++)
-            {
-                hold = fgetc(sockrfp);
-                memcpy(cache->Entries[found]->Object + header_len + i, &hold, 1);
-                write(fileno(clientsock), &hold, 1);
-            }
-        }
-
         //update key to url
         strcpy(cache->Entries[found]->key, url);
         cache->Entries[found]->maxage=age;
@@ -483,7 +585,7 @@ static void relay_http(char* method, char* path, char* protocol, int serverfd, i
         cache->Entries[found]->firstline=strdup(firstlen);
         //value is now cached
         FREE(firstlen);
-        FREE(buff);
+        FREE(buff);*/
         HeaderFieldsList_free(&header_fields);
     }//end of cache miss   
 }
@@ -558,8 +660,6 @@ bool explode_start_line(char *buf, char *method, char *url,
  * References: https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
  * 
  * Returns true if successfully parsed or false otherwise.
- * 
- * // TODO: currently this assumes properly formatted start line
  */
 bool explode_url(char *url, char *host, int *port, char *path)
 {
@@ -835,7 +935,6 @@ int main(int argc, const char **argv) {
                     close_client(&clients, &master_fds, childfd);
                     continue;
                 }
-                exit(EXIT_FAILURE);
 
                 //Now client socket has been connected to server
                 //open read and write channels

@@ -36,7 +36,39 @@ typedef struct HTTPMessage{
     HeaderFieldsList header;
     char *body;
     size_t content_len;
+    bool has_full_header;
+    bool is_complete;
+    char *unprocessed;
+    int bytes_unprocessed;
 } *HTTPMessage;
+
+HTTPMessage HTTPMessage_new()
+{
+    HTTPMessage msg;
+    NEW(msg);
+    msg->start_line = NULL;
+    msg->header = HeaderFieldsList_new();
+    msg->body = NULL;
+    msg->content_len = 0;
+    msg->has_full_header = false;
+    msg->is_complete = false;
+    msg->unprocessed = NULL;
+    msg->bytes_unprocessed = 0;
+    return msg;
+}
+
+void HTTPMessage_free(HTTPMessage *httpmsg)
+{
+    HTTPMessage msg = *httpmsg;
+    HeaderFieldsList_free(&(msg->header));
+    if (msg->start_line != NULL)
+        FREE(msg->start_line);
+    if (msg->body != NULL)
+        FREE(msg->body);
+    if (msg->unprocessed != NULL)
+        FREE(msg->unprocessed);
+    FREE(*httpmsg);
+}
 
 void check_usage(int argc, const char* argv[])
 {
@@ -58,8 +90,132 @@ void close_client(ClientList *clients, fd_set *master_fds, int sckt)
     close(sckt);
 }
 
-int read_sckt(int sckt, HTTPMessage message)
+/*
+ * Function: get_line
+ * ------------------
+ *   Returns the first line in buf as a nul-terminated malloc'ed c-string or 
+ *   NULL if not found. Moves buf head to one after new line. Updates bytes to
+ *   new length in buf.
+ * 
+ *   buf: an array of characters
+ *   bytes: pointer to the length of buf
+ */
+char *get_line(char **buf, int *bytes)
 {
+    char *end_ptr, *line;
+    int i;
+    size_t line_len;
+
+    if (*bytes == 0)
+        return NULL;
+
+    end_ptr = *buf;
+    for (i = 0; i < *bytes; end_ptr++, i++)
+        if (*end_ptr == '\n')
+            break;
+
+    line = NULL;
+    if (*end_ptr == '\n')
+    {
+        line_len = end_ptr - *buf + 1;
+        line = malloc(line_len + 1);
+        memcpy(line, *buf, line_len);
+        line[line_len] = '\0';
+        *buf = *buf + line_len;
+        *bytes = *bytes - line_len;
+    }
+    return line;
+}
+
+/*
+ * Function: extract_header
+ * ------------------------
+ *   Extract the header from buf and store in msg. Moves buf head to one after
+ *   the last complete header item processed. Updates bytes to
+ *   new length in buf.
+ */
+void extract_header(char **buf, int *bytes, HTTPMessage msg)
+{
+    char *line;
+    bool start_line;
+
+    start_line = true;
+    while ((line = get_line(buf, bytes)) != NULL && !(msg->has_full_header))
+    {
+        if (start_line)
+        {
+            msg->start_line = line;
+            start_line = false;
+        }
+        else if (strcmp(line, "\r\n") == 0)
+        {
+            msg->has_full_header = true;
+            FREE(line);
+        }
+        else
+            msg->header = HeaderFieldsList_push(msg->header, line);
+    }
+}
+
+/*
+ * Function: get_content_len
+ * -------------------------
+ *   Returns the content length, as specified in the header.
+ */
+size_t get_content_len(HeaderFieldsList header)
+{
+    char *field = HeaderFieldsList_get(header, "Content-Length");
+    if (field != NULL)
+        return atoll(field + 15);
+    else
+        return 0;
+}
+
+/*
+ * Function: read_sckt
+ * -------------------
+ *   Reads a request or response from the client at given socket and stores
+ *   the message in the given HTTPMessage.
+ *   
+ *   Returns false if the read failed and true otherwise;
+ */
+bool read_sckt(int sckt, HTTPMessage msg)
+{
+    int bytes;
+    char *buf, *buf_dup;
+    size_t content_len;
+
+    buf = malloc(BUFF_SIZE);
+    if ((bytes = read(sckt, buf, BUFF_SIZE)) <= 0)
+        return false;
+    
+    // TODO: include unprocessed bytes in processing.
+    buf_dup = buf;
+    extract_header(&buf, &bytes, msg);
+
+    if (msg->has_full_header)
+    {
+        content_len = get_content_len(msg->header);
+        if (content_len > 0)
+        {
+            // TODO: process body
+        }
+        else
+        {
+            msg->is_complete = true;
+            if (bytes > 0)
+                return false;
+        }
+    }
+    
+    if (bytes > 0)
+    {
+        msg->unprocessed = buf;
+        msg->bytes_unprocessed = bytes;
+    }
+    else
+        FREE(buf_dup);
+
     return true;
 }
 
@@ -70,7 +226,6 @@ int main(int argc, const char *argv[])
     int fdmax; // highest socket number
     int sckt; // socket loop counter
     ClientList clients; // list of client connections
-    int read_result, process_result;
     HTTPMessage req, res;
 
     check_usage(argc, argv);
@@ -130,9 +285,20 @@ int main(int argc, const char *argv[])
             else // Data arriving from already connected socket
             {
                 printf("Processing request\n"); // TODO remove
-                NEW(req);
-                read_result = read_sckt(sckt, req);
-                FREE(req);
+                req = HTTPMessage_new();
+                if (read_sckt(sckt, req) && req->is_complete)
+                {
+                    printf("\nRequest Header:\n"); // TODO remove
+                    printf(req->start_line); // TODO remove
+                    HeaderFieldsList_print(req->header); // TODO remove
+                    printf("\n"); // TODO remove
+                }
+                else
+                {
+                    fprintf(stderr, "Bad request\n");
+                    close_client(&clients, &master_fds, sckt);
+                }
+                HTTPMessage_free(&req);
             }
         }
         count++; // TODO remove

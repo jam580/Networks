@@ -16,7 +16,8 @@ HeaderFieldsList HeaderFieldsList_new()
 
 HeaderFieldsList HeaderFieldsList_push(HeaderFieldsList hfl, char *l)
 {
-    char *dup = strdup(l);
+    //char *dup = strdup(l);
+    char *dup = l;
     return List_append(hfl, List_push(NULL, dup));
 }
 

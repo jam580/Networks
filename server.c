@@ -46,6 +46,11 @@ typedef struct HTTPMessage{
     int bytes_unprocessed;
 } *HTTPMessage;
 
+typedef struct Directive{
+    char *key;
+    char *value;
+} Directive;
+
 HTTPMessage HTTPMessage_new()
 {
     HTTPMessage msg;
@@ -266,6 +271,7 @@ bool read_sckt(int sckt, HTTPMessage msg)
     if (bytes <= 0)
     {
         printf("bad read\n"); // TODO remove
+        FREE(buf);
         return false;
     }
     else
@@ -459,13 +465,164 @@ bool get_res(HTTPMessage req, HTTPMessage res, int server)
 }
 
 /*
+ * Function: get_directives
+ * ------------------------
+ * Extracts the directives from the header field and returns them as an array
+ * of directives.
+ * 
+ * field: header field
+ * start: start position of directives
+ * max: maximum number of directives to extract
+ * dirs: array to store Directives in
+ */
+int get_directives(char *field, int start, int max, Directive dirs[])
+{
+    int stop, i;
+    char tmp;
+    bool more_directives;
+
+    more_directives = true;
+    for (i = 0; i < max && more_directives; i++)
+    {
+        while (field[start] == ' ') { start++; }
+        stop = start;
+        while (field[stop] != '=' && field[stop] != ',' &&
+               field[stop] != '\r' && field[stop] != '\n') 
+        { 
+            stop++; 
+        }
+
+        tmp = field[stop];
+        field[stop] = '\0';
+        dirs[i].key = strdup(field+start);
+        field[stop] = tmp;
+
+        if (field[stop] == '=')
+        {
+            start = ++stop;
+            while (field[stop] != ',' && field[stop] != '\r' && field[stop] != '\n')
+                stop++;
+
+            tmp = field[stop];
+            field[stop] = '\0';
+            dirs[i].value = strdup(field+start);
+            field[stop] = tmp;
+        }
+        
+        if (field[stop] != ',')
+            more_directives = false;
+        start = stop + 1;
+    }
+    return i;
+}
+
+void process_keep_alive(ClientList *clients, int client, char *field)
+{
+    Directive dirs[10];
+    int num_dirs, i, timeout;
+
+    if (field == NULL)
+        return;
+    
+    for (i = 0; i < 10; i++)
+    {
+        dirs[i].key = NULL;
+        dirs[i].value = NULL;
+    }
+
+    num_dirs = get_directives(field, strlen("keep-alive:"), 10, dirs);
+    for (i = 0; i < num_dirs; i++)
+    {
+        if (strcasecmp("timeout", dirs[i].key) == 0)
+        {
+            timeout = atoi(dirs[i].value);
+            ClientList_set_keepalive(*clients, client, true, timeout);
+            break;
+        }
+    }
+
+    for (i = 0; i < 10; i++)
+    {
+        FREE(dirs[i].key);
+        FREE(dirs[i].value);
+    }
+}
+
+/*
+ * Function: process_connection_header
+ * -----------------------------------
+ * Ensures req message has the proper connection header to forward to
+ * server and updated client information with appropriate persistency.
+ * 
+ * req: the request message
+ * protocol: the HTTP protocol used by the client
+ * client: the client socket
+ * clients: pointer to client list
+ * 
+ * Notes:
+ *  - RFC 7230: Proxies are not allowed to persist connections with 1.0 clients
+ *  - RFC 7230: 1.1 clients use persistent connections by default.
+ */
+void process_connection_header(HTTPMessage req, char *protocol, int client, 
+    ClientList *clients)
+{
+    char *field;
+    Directive dirs[10];
+    int num_dirs, i;
+
+    for (i = 0; i < 10; i++)
+    {
+        dirs[i].key = NULL;
+        dirs[i].value = NULL;
+    }
+
+    if (strcmp(protocol, "HTTP/1.0") == 0)
+        ClientList_set_keepalive(*clients, client, false, -1);
+    else
+    {
+        field = HeaderFieldsList_get(req->header, "Connection");
+        if (field != NULL)
+        {
+            num_dirs = get_directives(field, strlen("connection:"), 10, dirs);
+            for (i = 0; i < num_dirs; i++)
+            {
+                if (strcasecmp("close", dirs[i].key) == 0)
+                {
+                    ClientList_set_keepalive(*clients, client, false, -1);
+                    break;
+                }
+                if (strcasecmp("keep-alive", dirs[i].key) == 0)
+                {
+                    process_keep_alive(clients, client, 
+                        HeaderFieldsList_get(req->header, dirs[i].key));
+                }
+
+                req->header = HeaderFieldsList_remove(req->header, dirs[i].key);
+            }
+            req->header = HeaderFieldsList_remove(req->header, "Connection");
+        }
+    }
+
+    // Push our desired connection with remote server. 
+    field = strdup("Connection: close\r\n");
+    req->header = HeaderFieldsList_push(req->header, field);
+
+    for (i = 0; i < 10; i++)
+    {
+        FREE(dirs[i].key);
+        FREE(dirs[i].value);
+    }
+}
+
+/*
  * Function: process_req
  * ---------------------
  *   Forwards the req to the appropriate server and stores response in res.
  * 
  *   Returns file descriptor for server if successful and -1 otherwise.
  */
-int process_req(HTTPMessage req, HTTPMessage res, int client)
+int process_req(HTTPMessage req, HTTPMessage res, int client, 
+    ClientList *clients)
 {
     int ret_val;
     char *method, *url, *protocol;
@@ -497,15 +654,27 @@ int process_req(HTTPMessage req, HTTPMessage res, int client)
             ret_val = server_fd;
             if (server_fd >= 0 && strcmp(method, "GET") == 0)
             {
-                // TODO Process Connection Header
+                process_connection_header(req, protocol, client, clients);
                 if (!get_res(req, res, server_fd))
                     ret_val = -1;
-                else if (!write_msg(res, client))
-                    ret_val = -1;
+                else
+                {
+                    res->header = 
+                        HeaderFieldsList_remove(res->header, "Connection");
+                    if (ClientList_keepalive(*clients, client))
+                        res->header = HeaderFieldsList_push(res->header, 
+                            strdup("Connection: keep-alive\r\n"));
+                    else
+                        res->header = HeaderFieldsList_push(res->header, 
+                            strdup("Connection: close\r\n"));
+                    
+                    if (!write_msg(res, client))
+                        ret_val = -1;
+                }
             }
             else if (server_fd >= 0 && strcmp(method, "CONNECT") == 0)
             {
-
+                // TODO https
             }
             else
                 ret_val = -1; 
@@ -603,7 +772,7 @@ int main(int argc, const char *argv[])
                 else if (req->is_complete)
                 {
                     res = HTTPMessage_new();
-                    server_fd = process_req(req, res, sckt);
+                    server_fd = process_req(req, res, sckt, &clients);
                     if(server_fd <= 0)
                     {
                         fprintf(stderr, "Failed to process request\n");
@@ -620,7 +789,8 @@ int main(int argc, const char *argv[])
                     }
                     HTTPMessage_free(&res);
                 }
-                close_client(&clients, &master_fds, sckt, sckt_to_msg);
+                if (!ClientList_keepalive(clients, sckt))
+                    close_client(&clients, &master_fds, sckt, sckt_to_msg);
             }
         }
     }

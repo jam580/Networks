@@ -72,8 +72,8 @@ server: a1.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o
 server_local: a1.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o
 	$(CC) $(LDFLAGS) -o server a1.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o $(LDLIBS_LOCAL)
 
-server_new: server.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o socketconn.o
-	$(CC) $(LDFLAGS) -o server server.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o socketconn.o $(LDLIBS)
+server_new: server.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o socketconn.o atom.o table.o
+	$(CC) $(LDFLAGS) -o server server.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o socketconn.o atom.o table.o $(LDLIBS)
 
 test_clientlist: clientlist_test.o clientlist.o clientinfo.o list.o mem.o failure.o
 	$(CC) $(LDFLAGS) -o test_clientlist clientlist_test.o clientlist.o clientinfo.o list.o mem.o failure.o $(LDLIBS)

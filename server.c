@@ -20,11 +20,14 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <errno.h>
 #include "failure.h"
 #include "mem.h"
 #include "clientlist.h"
 #include "headerfieldslist.h"
 #include "socketconn.h"
+#include "table.h"
+#include "atom.h"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -36,6 +39,7 @@ typedef struct HTTPMessage{
     HeaderFieldsList header;
     char *body;
     size_t content_len;
+    size_t body_remaining;
     bool has_full_header;
     bool is_complete;
     char *unprocessed;
@@ -50,6 +54,7 @@ HTTPMessage HTTPMessage_new()
     msg->header = HeaderFieldsList_new();
     msg->body = NULL;
     msg->content_len = 0;
+    msg->body_remaining = 0;
     msg->has_full_header = false;
     msg->is_complete = false;
     msg->unprocessed = NULL;
@@ -60,7 +65,8 @@ HTTPMessage HTTPMessage_new()
 void HTTPMessage_free(HTTPMessage *httpmsg)
 {
     HTTPMessage msg = *httpmsg;
-    HeaderFieldsList_free(&(msg->header));
+    if (msg->header != NULL)
+        HeaderFieldsList_free(&(msg->header));
     if (msg->start_line != NULL)
         FREE(msg->start_line);
     if (msg->body != NULL)
@@ -82,12 +88,58 @@ void check_usage(int argc, const char* argv[])
     }
 }
 
-void close_client(ClientList *clients, fd_set *master_fds, int sckt)
+void close_client(ClientList *clients, fd_set *master_fds, int sckt, 
+    Table_T sckt_to_msg)
 {
+    HTTPMessage msg;
     printf("Closing connection\n");
     FD_CLR(sckt, master_fds);
     *clients = ClientList_remove(*clients, sckt);
+    msg = Table_get(sckt_to_msg, Atom_int(sckt));
+    HTTPMessage_free(&msg);
+    Table_remove(sckt_to_msg, Atom_int(sckt));
     close(sckt);
+}
+
+/*
+ * Function: write_msg
+ * -------------------
+ *   Write the given msg to the given sckt. It is a checked runtime error to
+ *   provide an msg that is not complete or a NULL msg. It is an unched runtime
+ *   error to provide an sckt with that is not properly connected.
+ */
+bool write_msg(HTTPMessage msg, int sckt)
+{
+    int bytes;
+    char *field;
+    HeaderFieldsList header;
+
+    assert(msg && msg->is_complete);
+    bytes = write(sckt, msg->start_line, strlen(msg->start_line));
+    if (bytes <= 0) 
+        return false;
+    
+    header = msg->header;
+    for (; header != NULL; header = header->rest)
+    {
+        field = header->first;
+        bytes = write(sckt, field, strlen(field));
+        if (bytes <= 0)
+            return false;
+    }
+
+    bytes = write(sckt, "\r\n", 2); // new line end of header
+    if (bytes <= 0)
+        return false;
+
+    if (msg->content_len > 0)
+    {
+        bytes = write(sckt, msg->body, msg->content_len);
+        if (bytes <= 0)
+            return false;
+    }
+    
+    return true;
 }
 
 /*
@@ -115,7 +167,7 @@ char *get_line(char **buf, int *bytes)
             break;
 
     line = NULL;
-    if (*end_ptr == '\n')
+    if (i != *bytes && *end_ptr == '\n')
     {
         line_len = end_ptr - *buf + 1;
         line = malloc(line_len + 1);
@@ -139,15 +191,15 @@ void extract_header(char **buf, int *bytes, HTTPMessage msg)
     char *line;
     bool start_line;
 
-    start_line = true;
-    while ((line = get_line(buf, bytes)) != NULL && !(msg->has_full_header))
+    start_line = msg->start_line == NULL;
+    while (!(msg->has_full_header) && (line = get_line(buf, bytes)) != NULL)
     {
         if (start_line)
         {
             msg->start_line = line;
             start_line = false;
         }
-        else if (strcmp(line, "\r\n") == 0)
+        else if (strcmp(line, "\r\n") == 0 || strcmp(line, "\n") == 0)
         {
             msg->has_full_header = true;
             FREE(line);
@@ -155,6 +207,25 @@ void extract_header(char **buf, int *bytes, HTTPMessage msg)
         else
             msg->header = HeaderFieldsList_push(msg->header, line);
     }
+}
+
+/*
+ * Function: extract_body
+ * ------------------------
+ *   Extract up to bytes given of the content/body from buf and store in msg.
+ *   returns number of bytes remaining in given body.
+ */
+int extract_body(char *body, int bytes, HTTPMessage msg)
+{
+    size_t body_read, bytes_copied;
+
+    body_read = msg->content_len - msg->body_remaining;
+    bytes_copied = MIN((size_t)bytes, msg->body_remaining);
+    memcpy(msg->body + body_read, body, bytes_copied);
+    bytes = bytes - bytes_copied;
+    msg->body_remaining = msg->body_remaining - bytes_copied;
+
+    return bytes;
 }
 
 /*
@@ -186,37 +257,268 @@ bool read_sckt(int sckt, HTTPMessage msg)
     size_t content_len;
 
     buf = malloc(BUFF_SIZE);
-    if ((bytes = read(sckt, buf, BUFF_SIZE)) <= 0)
+    if (msg->bytes_unprocessed > 0)
+        memcpy(buf, msg->unprocessed, msg->bytes_unprocessed);
+
+    bytes = read(sckt, 
+                 buf + msg->bytes_unprocessed, 
+                 BUFF_SIZE - msg->bytes_unprocessed);
+    if (bytes <= 0)
+    {
+        printf("bad read\n"); // TODO remove
         return false;
+    }
+    else
+    {
+        bytes += msg->bytes_unprocessed;
+        msg->bytes_unprocessed = 0;
+        FREE(msg->unprocessed);
+    }
     
-    // TODO: include unprocessed bytes in processing.
     buf_dup = buf;
     extract_header(&buf, &bytes, msg);
 
     if (msg->has_full_header)
     {
         content_len = get_content_len(msg->header);
+        msg->content_len = content_len;
         if (content_len > 0)
         {
-            // TODO: process body
+            if (msg->body == NULL)
+            {
+                msg->body_remaining = content_len;
+                msg->body = calloc(content_len, sizeof(*(msg->body)));
+            }
+            bytes = extract_body(buf, bytes, msg);
+            if (msg->body_remaining == 0)
+            {
+                msg->is_complete = true;
+                if (bytes > 0)
+                {
+                    printf("content read but still has more bytes"); // TODO remove
+                    return false;
+                }
+            }
         }
         else
         {
             msg->is_complete = true;
             if (bytes > 0)
+            {
+                printf("no content but still has more bytes"); // TODO remove
                 return false;
+            }
         }
     }
     
     if (bytes > 0)
     {
-        msg->unprocessed = buf;
+        msg->unprocessed = malloc(bytes);
+        memcpy(msg->unprocessed, buf, bytes);
         msg->bytes_unprocessed = bytes;
     }
+    
+    FREE(buf_dup);
+    return true;
+}
+
+/*
+ * Function: explode_start_line
+ * ----------------------------
+ *   Split the start line into the method, the request-targer, and the protocol.
+ *   More infor in RFC 7230, pg. 21. Max length of each pointer given by len.
+ * 
+ *   Returns false on failure and true otherwise.
+ */
+bool explode_start_line(char *line, char *m, char *u, char *p)
+{
+    return sscanf(line, "%s %s %s", m, u, p);
+}
+
+/*
+ * Function: explode_url
+ * ---------------------
+ *   Split the url into host, path, and port if they exist. An empty value
+ *   (e.g. strlen(port) == 0) indicates that it was not found. Each section
+ *   will not be nul-terminated.
+ *   References: https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
+ */
+void explode_url(char *url, char *host, char *port, char *path)
+{
+    char *host_start, *port_start, *path_start;
+
+    host[0] = '\0';
+    port[0] = '\0';
+    path[0] = '\0';
+
+    // Finding the starting pointers of each section
+    host_start = strstr(url, "://");
+    if (host_start == NULL)
+        return;
+    host_start += 3;
+
+    port_start = strstr(host_start, ":");
+    if (port_start)
+    {
+        port_start++;
+        path_start = strstr(port_start, "/");
+    }
     else
-        FREE(buf_dup);
+        path_start = strstr(host_start, "/");
+
+    // Copy relevant sections to locations
+    if (port_start)
+    {
+        memcpy(host, host_start, port_start - host_start - 1);
+        if (path_start)
+        {
+            memcpy(port, port_start, path_start - port_start);
+            strcpy(path, path_start);
+        }
+        else
+            strcpy(port, port_start);
+    }
+    else if (path_start)
+    {
+        memcpy(host, host_start, path_start - host_start);
+        strcpy(path, path_start);
+    }
+    else
+    {
+        strcpy(host, host_start);
+    }
+}
+
+/*
+ * Return whether http req method is supported by this proxy
+ */
+bool method_is_supported(char *meth)
+{
+    return strcmp(meth, "GET") == 0 ||
+           strcmp(meth, "CONNECT");
+}
+
+/*
+ * Returns file descriptor to connection to host at port or -1 if failed.
+ */
+int build_server_conn(char *host, char *port)
+{
+    SocketConn server;
+    struct hostent *serverip;
+    unsigned int s_addr;
+    int fd;
+
+    serverip = gethostbyname(host);
+    if (serverip == NULL)
+    {
+        printf("No host\n");
+        return -1;
+    }
+
+    s_addr = 0;
+    memcpy(&s_addr, serverip->h_addr, serverip->h_length);
+
+    server = SocketConn_new();
+    if (!SocketConn_open(server, atoi(port), s_addr))
+    {
+        printf("Failed to open\n");
+        SocketConn_free(&server);
+        return -1;
+    }
+    if (!SocketConn_connect(server))
+    {
+        printf("Failed to connect\n");
+        SocketConn_free(&server);
+        return -1;
+    }
+
+    fd = server->fd;
+    SocketConn_free(&server);
+
+    return fd;
+}
+
+/*
+ * Function: get_res
+ * -----------------
+ *   Forwards the req to the given socket and stores response in res
+ * 
+ *   Returns false on failure and true otherwise
+ */
+bool get_res(HTTPMessage req, HTTPMessage res, int server)
+{
+    if(!write_msg(req, server))
+        return false;
+
+    while (!res->is_complete && read_sckt(server, res)) {}
+
+    if (!res->is_complete)
+        return false;
 
     return true;
+}
+
+/*
+ * Function: process_req
+ * ---------------------
+ *   Forwards the req to the appropriate server and stores response in res.
+ * 
+ *   Returns file descriptor for server if successful and -1 otherwise.
+ */
+int process_req(HTTPMessage req, HTTPMessage res, int client)
+{
+    int ret_val;
+    char *method, *url, *protocol;
+    char *host, *port, *path;
+    size_t line_len, url_len;
+    int server_fd;
+
+    line_len = strlen(req->start_line);
+    method = calloc(line_len, sizeof(*method));
+    url = calloc(line_len, sizeof(*url));
+    protocol = calloc(line_len, sizeof(*protocol));
+
+    ret_val = -1;
+    if (explode_start_line(req->start_line, method, url, protocol) && 
+        method_is_supported(method))
+    {
+        url_len = strlen(url);
+        host = calloc(url_len, sizeof(*host));
+        port = calloc(url_len, sizeof(*port));
+        path = calloc(url_len, sizeof(*path));
+        explode_url(url, host, port, path);
+
+        if (url[0] != '\0')
+        {
+            if (port[0] == '\0')
+                strcpy(port, "80");
+
+            server_fd = build_server_conn(host, port);
+            ret_val = server_fd;
+            if (server_fd >= 0 && strcmp(method, "GET") == 0)
+            {
+                // TODO Process Connection Header
+                if (!get_res(req, res, server_fd))
+                    ret_val = -1;
+                else if (!write_msg(res, client))
+                    ret_val = -1;
+            }
+            else if (server_fd >= 0 && strcmp(method, "CONNECT") == 0)
+            {
+
+            }
+            else
+                ret_val = -1; 
+        }
+        FREE(host);
+        FREE(port);
+        FREE(path);
+    }
+    
+    FREE(method);
+    FREE(url);
+    FREE(protocol);
+    return ret_val;
 }
 
 int main(int argc, const char *argv[]) 
@@ -227,10 +529,14 @@ int main(int argc, const char *argv[])
     int sckt; // socket loop counter
     ClientList clients; // list of client connections
     HTTPMessage req, res;
+    Table_T sckt_to_msg;
+    int expected_clients; // expected number of concurrent clients
+    int server_fd;
 
     check_usage(argc, argv);
     parent = SocketConn_new();
     SocketConn_set_portno(parent, atoi(argv[1]));
+    expected_clients = 100;
     
     // Set up parent socket
     if (!SocketConn_open(parent, -1, INADDR_ANY))
@@ -249,13 +555,13 @@ int main(int argc, const char *argv[])
     signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE    
     clients = ClientList_new(); // initialize clients list
     child = SocketConn_new(); // initialize empty child connection
+    sckt_to_msg = Table_new(expected_clients, NULL, NULL);
 
-    int count = 0; // TODO remove
-    while(count < 2) // TODO change to while(true)
+    while(true)
     {
         for (sckt = 0; sckt <= fdmax; sckt++) 
             if (!ClientList_keepalive(clients, sckt))
-                close_client(&clients, &master_fds, sckt);
+                close_client(&clients, &master_fds, sckt, sckt_to_msg);
 
         read_fds = master_fds;
 
@@ -270,12 +576,14 @@ int main(int argc, const char *argv[])
 
             if (sckt == parent->fd) // Incoming connection request
             {
-                printf("Accepting new connection\n"); // TODO remove
                 if (SocketConn_accept(parent, child))
                 {
                     FD_SET(child->fd, &master_fds);
                     fdmax = MAX(child->fd, fdmax);
                     clients = ClientList_push(clients, child->fd);
+                    Table_put(sckt_to_msg, Atom_int(child->fd), 
+                              HTTPMessage_new());
+                    printf("Accepted Connection %d\n", child->fd); // TODO remove
                 }
                 else
                 {
@@ -284,26 +592,47 @@ int main(int argc, const char *argv[])
             }
             else // Data arriving from already connected socket
             {
-                printf("Processing request\n"); // TODO remove
-                req = HTTPMessage_new();
-                if (read_sckt(sckt, req) && req->is_complete)
-                {
-                    printf("\nRequest Header:\n"); // TODO remove
-                    printf(req->start_line); // TODO remove
-                    HeaderFieldsList_print(req->header); // TODO remove
-                    printf("\n"); // TODO remove
-                }
-                else
+                printf("Processing request on %d\n", sckt); // TODO remove
+                req = Table_get(sckt_to_msg, Atom_int(sckt));
+                if (!read_sckt(sckt, req))
                 {
                     fprintf(stderr, "Bad request\n");
-                    close_client(&clients, &master_fds, sckt);
+                    close_client(&clients, &master_fds, sckt, sckt_to_msg);
+                    continue;
                 }
-                HTTPMessage_free(&req);
+                else if (req->is_complete)
+                {
+                    res = HTTPMessage_new();
+                    server_fd = process_req(req, res, sckt);
+                    if(server_fd <= 0)
+                    {
+                        fprintf(stderr, "Failed to process request\n");
+                        close_client(&clients, &master_fds, sckt, sckt_to_msg);
+                        continue;
+                    }
+                    else
+                    {
+                        fprintf(stderr, "Request processed\n");
+                        Table_put(sckt_to_msg, Atom_int(sckt), 
+                                  HTTPMessage_new());
+                        HTTPMessage_free(&req);
+                        close(server_fd);
+                    }
+                    HTTPMessage_free(&res);
+                }
+                close_client(&clients, &master_fds, sckt, sckt_to_msg);
             }
         }
-        count++; // TODO remove
     }
 
+    for (sckt = 0; sckt <= fdmax; sckt++)
+    {
+        req = Table_get(sckt_to_msg, Atom_int(sckt));
+        if (req)
+            HTTPMessage_free(&req);
+    }
+
+    Table_free(&sckt_to_msg);
     ClientList_free(&clients);
     SocketConn_close(parent);
     SocketConn_free(&parent);

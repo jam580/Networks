@@ -62,7 +62,7 @@ char* HeaderFieldsList_get(HeaderFieldsList hfl, char *field)
     while (head != NULL)
     {
         line = head->first;
-        if (strncmp(line, field, len) == 0)
+        if (strncasecmp(line, field, len) == 0)
         {
             return line;
         }

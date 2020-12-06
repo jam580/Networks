@@ -28,6 +28,7 @@
 #include "socketconn.h"
 #include "table.h"
 #include "atom.h"
+#include "cache.h"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -331,7 +332,9 @@ bool read_sckt(int sckt, HTTPMessage msg)
 /*
  * Function: explode_start_line
  * ----------------------------
- *   Split the start line into the method, the request-targer, and the protocol.
+ *   Split the start line into 
+ *   a) the method, the request-target, and the protocol for requests or 
+ *   b) the protocol, code, and phrase for responses.
  *   More infor in RFC 7230, pg. 21. Max length of each pointer given by len.
  * 
  *   Returns false on failure and true otherwise.
@@ -615,20 +618,104 @@ void process_connection_header(HTTPMessage req, char *protocol, int client,
 }
 
 /*
+ * Function: should_cache
+ * ----------------------
+ * Determine if res should be cached and update secs_to_live if applicable
+ * 
+ * Directives implemented: no-store, public, private, max-age, s-maxage
+ * Directives not implemented: must-revalidate, no-cache, no-transform,
+ *      proxy-revalidate
+ */                         
+bool should_cache(HTTPMessage res, int *secs_to_live)
+{
+    Directive dirs[10];
+    int num_dirs, i, code_num;
+    char *field, *protocol, *code, *reason;
+    bool cacheable, s_max_age_set;
+
+    *secs_to_live = 0;
+    field = HeaderFieldsList_get(res->header, "Cache-Control");
+    if (field == NULL)
+        return true;
+    
+    for (i = 0; i < 10; i++)
+    {
+        dirs[i].key = NULL;
+        dirs[i].value = NULL;
+    }
+
+    cacheable = true;
+    s_max_age_set = false;
+    num_dirs = get_directives(field, strlen("cache-control:"), 10, dirs);
+
+    protocol = calloc(strlen(res->start_line), 1);
+    code = calloc(strlen(res->start_line), 1);
+    reason = calloc(strlen(res->start_line), 1);
+    explode_start_line(res->start_line, protocol, code, reason);
+    code_num = atoi(code);
+    if (code_num != 200 && code_num != 203 && code_num != 204 && 
+        code_num != 206 && code_num != 300 && code_num != 301 && 
+        code_num != 404 && code_num != 405 && code_num != 410 && 
+        code_num != 414 && code_num != 501)
+        cacheable = false;
+
+    for (i = 0; i < num_dirs; i++)
+    {
+        if (strcasecmp("no-store", dirs[i].key) == 0)
+        {
+            cacheable = false;
+            break;
+        }
+        else if (strcasecmp("private", dirs[i].key) == 0)
+        {
+            cacheable = false;
+            break;
+        }
+        else if (strcasecmp("public", dirs[i].key) == 0)
+        {
+            cacheable = true;
+        }
+        else if (strcasecmp("max-age", dirs[i].key) == 0)
+        {
+            if (!s_max_age_set)
+                *secs_to_live = atoi(dirs[i].value);
+        }
+        if (strcasecmp("s-maxage", dirs[i].key) == 0)
+        {
+            s_max_age_set = true;
+            *secs_to_live = atoi(dirs[i].value);
+        }
+    }
+
+    for (i = 0; i < 10; i++)
+    {
+        FREE(dirs[i].key);
+        FREE(dirs[i].value);
+    }
+
+    FREE(protocol);
+    FREE(code);
+    FREE(reason);
+    return cacheable;
+}
+
+/*
  * Function: process_req
  * ---------------------
  *   Forwards the req to the appropriate server and stores response in res.
  * 
  *   Returns file descriptor for server if successful and -1 otherwise.
  */
-int process_req(HTTPMessage req, HTTPMessage res, int client, 
-    ClientList *clients)
+int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache)
 {
     int ret_val;
     char *method, *url, *protocol;
     char *host, *port, *path;
     size_t line_len, url_len;
     int server_fd;
+    HTTPMessage res;
+    int secs_to_live, age;
+    char *age_hdr;
 
     line_len = strlen(req->start_line);
     method = calloc(line_len, sizeof(*method));
@@ -655,9 +742,29 @@ int process_req(HTTPMessage req, HTTPMessage res, int client,
             if (server_fd >= 0 && strcmp(method, "GET") == 0)
             {
                 process_connection_header(req, protocol, client, clients);
-                if (!get_res(req, res, server_fd))
-                    ret_val = -1;
+                res = Cache_get(cache, url, &age);
+                
+                if (res == NULL)
+                {
+                    res = HTTPMessage_new();
+                    if (!get_res(req, res, server_fd))
+                        ret_val = -1;
+                    else
+                    {
+                        secs_to_live = 0;
+                        if (should_cache(res, &secs_to_live))
+                            Cache_put(cache, url, res, secs_to_live);
+                    }
+                }
                 else
+                {
+                    age_hdr = calloc(18, 1);
+                    sprintf(age_hdr, "Age: %d\r\n", age);
+                    res->header = HeaderFieldsList_remove(res->header, "Age");
+                    res->header = HeaderFieldsList_push(res->header, age_hdr);
+                }
+
+                if (ret_val != -1)
                 {
                     res->header = 
                         HeaderFieldsList_remove(res->header, "Connection");
@@ -701,6 +808,7 @@ int main(int argc, const char *argv[])
     Table_T sckt_to_msg;
     int expected_clients; // expected number of concurrent clients
     int server_fd;
+    Cache_T cache;
 
     check_usage(argc, argv);
     parent = SocketConn_new();
@@ -725,6 +833,7 @@ int main(int argc, const char *argv[])
     clients = ClientList_new(); // initialize clients list
     child = SocketConn_new(); // initialize empty child connection
     sckt_to_msg = Table_new(expected_clients, NULL, NULL);
+    cache = Cache_new(expected_clients);
 
     while(true)
     {
@@ -771,8 +880,7 @@ int main(int argc, const char *argv[])
                 }
                 else if (req->is_complete)
                 {
-                    res = HTTPMessage_new();
-                    server_fd = process_req(req, res, sckt, &clients);
+                    server_fd = process_req(req, sckt, &clients, cache);
                     if(server_fd <= 0)
                     {
                         fprintf(stderr, "Failed to process request\n");
@@ -787,7 +895,6 @@ int main(int argc, const char *argv[])
                         HTTPMessage_free(&req);
                         close(server_fd);
                     }
-                    HTTPMessage_free(&res);
                 }
                 if (!ClientList_keepalive(clients, sckt))
                     close_client(&clients, &master_fds, sckt, sckt_to_msg);
@@ -802,6 +909,7 @@ int main(int argc, const char *argv[])
             HTTPMessage_free(&req);
     }
 
+    Cache_free(&cache);
     Table_free(&sckt_to_msg);
     ClientList_free(&clients);
     SocketConn_close(parent);

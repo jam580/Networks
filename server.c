@@ -33,7 +33,7 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-#define BUFF_SIZE 2048
+#define BUFF_SIZE 10240
 
 typedef struct HTTPMessage{
     char *start_line;
@@ -95,16 +95,27 @@ void check_usage(int argc, const char* argv[])
 }
 
 void close_client(ClientList *clients, fd_set *master_fds, int sckt, 
-    Table_T sckt_to_msg)
+    Table_T sckt_to_msg, Table_T server2client, Table_T client2server)
 {
     HTTPMessage msg;
-    printf("Closing connection\n");
+    int *server_stored, *client_stored;
+
+    //printf("Closing connection %d\n", sckt); // TODO remove
     FD_CLR(sckt, master_fds);
     *clients = ClientList_remove(*clients, sckt);
     msg = Table_get(sckt_to_msg, Atom_int(sckt));
     HTTPMessage_free(&msg);
     Table_remove(sckt_to_msg, Atom_int(sckt));
     close(sckt);
+
+    if ((server_stored = Table_remove(client2server, Atom_int(sckt))))
+    {
+        client_stored = Table_remove(server2client, Atom_int(*server_stored));
+        FD_CLR(*server_stored, master_fds);
+        close(*server_stored);
+        FREE(client_stored);
+        FREE(server_stored);
+    }
 }
 
 /*
@@ -271,7 +282,7 @@ bool read_sckt(int sckt, HTTPMessage msg)
                  BUFF_SIZE - msg->bytes_unprocessed);
     if (bytes <= 0)
     {
-        printf("bad read\n"); // TODO remove
+        //printf("bad read\n"); // TODO remove
         FREE(buf);
         return false;
     }
@@ -302,7 +313,7 @@ bool read_sckt(int sckt, HTTPMessage msg)
                 msg->is_complete = true;
                 if (bytes > 0)
                 {
-                    printf("content read but still has more bytes"); // TODO remove
+                    //printf("content read but still has more bytes"); // TODO remove
                     return false;
                 }
             }
@@ -312,7 +323,7 @@ bool read_sckt(int sckt, HTTPMessage msg)
             msg->is_complete = true;
             if (bytes > 0)
             {
-                printf("no content but still has more bytes"); // TODO remove
+                //printf("no content but still has more bytes"); // TODO remove
                 return false;
             }
         }
@@ -363,8 +374,9 @@ void explode_url(char *url, char *host, char *port, char *path)
     // Finding the starting pointers of each section
     host_start = strstr(url, "://");
     if (host_start == NULL)
-        return;
-    host_start += 3;
+        host_start = url;
+    else
+        host_start += 3;
 
     port_start = strstr(host_start, ":");
     if (port_start)
@@ -404,7 +416,7 @@ void explode_url(char *url, char *host, char *port, char *path)
 bool method_is_supported(char *meth)
 {
     return strcmp(meth, "GET") == 0 ||
-           strcmp(meth, "CONNECT");
+           strcmp(meth, "CONNECT") == 0;
 }
 
 /*
@@ -700,13 +712,49 @@ bool should_cache(HTTPMessage res, int *secs_to_live)
 }
 
 /*
+ * Function: tunnel
+ * ----------------
+ *   Forwards the req to the appropriate server and stores response in res.
+ * 
+ *   Returns file descriptor for server if successful and -1 otherwise.
+ */
+bool tunnel(int from, int to)
+{
+    int read_bytes, write_bytes;
+    char *buf;
+    bool ret_val;
+    
+    ret_val = true;
+    buf = malloc(BUFF_SIZE);
+    read_bytes = read(from, buf, BUFF_SIZE);
+    if (read_bytes <= 0)
+    {
+        //printf("bad read tunnel error %d\n", errno); // TODO remove
+        ret_val = false;
+    }
+    else
+    {
+        write_bytes = write(to, buf, read_bytes);
+        if (write_bytes <= 0)
+        {
+            //printf("bad write tunnel %d\n", errno); // TODO remove
+            ret_val = false;
+        }
+    }
+
+    FREE(buf);
+    return ret_val;
+}
+
+/*
  * Function: process_req
  * ---------------------
  *   Forwards the req to the appropriate server and stores response in res.
  * 
  *   Returns file descriptor for server if successful and -1 otherwise.
  */
-int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache)
+int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
+    bool *https)
 {
     int ret_val;
     char *method, *url, *protocol;
@@ -716,6 +764,7 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache)
     HTTPMessage res;
     int secs_to_live, age;
     char *age_hdr;
+    bool res_cached;
 
     line_len = strlen(req->start_line);
     method = calloc(line_len, sizeof(*method));
@@ -739,52 +788,88 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache)
 
             server_fd = build_server_conn(host, port);
             ret_val = server_fd;
+            res = NULL;
             if (server_fd >= 0 && strcmp(method, "GET") == 0)
             {
+                *https = false;
                 process_connection_header(req, protocol, client, clients);
                 res = Cache_get(cache, url, &age);
                 
                 if (res == NULL)
                 {
+                    res_cached = false;
                     res = HTTPMessage_new();
                     if (!get_res(req, res, server_fd))
+                    {
+                        close(server_fd);
                         ret_val = -1;
+                    }
                     else
                     {
                         secs_to_live = 0;
                         if (should_cache(res, &secs_to_live))
+                        {
+                            res_cached = true;
                             Cache_put(cache, url, res, secs_to_live);
+                        }
                     }
                 }
                 else
                 {
+                    res_cached = true;
                     age_hdr = calloc(18, 1);
                     sprintf(age_hdr, "Age: %d\r\n", age);
                     res->header = HeaderFieldsList_remove(res->header, "Age");
                     res->header = HeaderFieldsList_push(res->header, age_hdr);
                 }
-
-                if (ret_val != -1)
-                {
-                    res->header = 
-                        HeaderFieldsList_remove(res->header, "Connection");
-                    if (ClientList_keepalive(*clients, client))
-                        res->header = HeaderFieldsList_push(res->header, 
-                            strdup("Connection: keep-alive\r\n"));
-                    else
-                        res->header = HeaderFieldsList_push(res->header, 
-                            strdup("Connection: close\r\n"));
-                    
-                    if (!write_msg(res, client))
-                        ret_val = -1;
-                }
             }
-            else if (server_fd >= 0 && strcmp(method, "CONNECT") == 0)
+            else if (strcmp(method, "CONNECT") == 0)
             {
-                // TODO https
+                *https = true;
+                process_connection_header(req, protocol, client, clients);
+                res_cached = false;
+                res = HTTPMessage_new();
+
+                if (server_fd >= 0)
+                   res->start_line = strdup("HTTP/1.1 200 OK\r\n");
+                else
+                {
+                    res->start_line = 
+                        strdup("HTTP/1.1 503 Service Unavailable\r\n");
+                }
+                res->has_full_header = true;
+                res->is_complete = true;
             }
             else
                 ret_val = -1; 
+
+            if (res && ret_val != -1)
+            {
+                res->header = 
+                    HeaderFieldsList_remove(res->header, "Connection");
+                if (ClientList_keepalive(*clients, client))
+                    res->header = HeaderFieldsList_push(res->header, 
+                        strdup("Connection: keep-alive\r\n"));
+                else
+                    res->header = HeaderFieldsList_push(res->header, 
+                        strdup("Connection: close\r\n"));
+
+                /*
+                printf("Response Header:\n");
+                printf("%s", res->start_line);
+                HeaderFieldsList_print(res->header);
+                printf("\n");*/ // TODO remove
+                
+                if (!write_msg(res, client))
+                {
+                    ret_val = -1;
+                    if (server_fd > 0)
+                        close(server_fd);
+                }
+            }
+
+            if (res && !res_cached)
+                HTTPMessage_free(&res);
         }
         FREE(host);
         FREE(port);
@@ -804,11 +889,12 @@ int main(int argc, const char *argv[])
     int fdmax; // highest socket number
     int sckt; // socket loop counter
     ClientList clients; // list of client connections
-    HTTPMessage req, res;
-    Table_T sckt_to_msg;
+    HTTPMessage req;
+    Table_T sckt_to_msg, server2client, client2server;
     int expected_clients; // expected number of concurrent clients
-    int server_fd;
+    int server_fd, *server_fd_store, *https_sckt;
     Cache_T cache;
+    bool https;
 
     check_usage(argc, argv);
     parent = SocketConn_new();
@@ -833,13 +919,16 @@ int main(int argc, const char *argv[])
     clients = ClientList_new(); // initialize clients list
     child = SocketConn_new(); // initialize empty child connection
     sckt_to_msg = Table_new(expected_clients, NULL, NULL);
+    server2client = Table_new(expected_clients, NULL, NULL);
+    client2server = Table_new(expected_clients, NULL, NULL);
     cache = Cache_new(expected_clients);
 
     while(true)
     {
         for (sckt = 0; sckt <= fdmax; sckt++) 
             if (!ClientList_keepalive(clients, sckt))
-                close_client(&clients, &master_fds, sckt, sckt_to_msg);
+                close_client(&clients, &master_fds, sckt, sckt_to_msg, 
+                    server2client, client2server);
 
         read_fds = master_fds;
 
@@ -870,34 +959,94 @@ int main(int argc, const char *argv[])
             }
             else // Data arriving from already connected socket
             {
-                printf("Processing request on %d\n", sckt); // TODO remove
-                req = Table_get(sckt_to_msg, Atom_int(sckt));
-                if (!read_sckt(sckt, req))
+                //printf("Processing request on %d\n", sckt); // TODO remove
+
+                https_sckt = Table_get(server2client, Atom_int(sckt));
+                if (https_sckt)
                 {
-                    fprintf(stderr, "Bad request\n");
-                    close_client(&clients, &master_fds, sckt, sckt_to_msg);
-                    continue;
-                }
-                else if (req->is_complete)
-                {
-                    server_fd = process_req(req, sckt, &clients, cache);
-                    if(server_fd <= 0)
+                    // route from server to client
+                    printf("Tunneling from %d to %d\n", sckt, *https_sckt); // TODO remove
+                    if (!tunnel(sckt, *https_sckt))
                     {
-                        fprintf(stderr, "Failed to process request\n");
-                        close_client(&clients, &master_fds, sckt, sckt_to_msg);
+                        close_client(&clients, &master_fds, *https_sckt, 
+                            sckt_to_msg, server2client, client2server);
+                    }
+                }
+                else if ((https_sckt = Table_get(client2server, Atom_int(sckt))))
+                {
+                    // route from client to server
+                    printf("Tunneling from %d to %d\n", sckt, *https_sckt); // TODO remove
+                    if (!tunnel(sckt, *https_sckt))
+                    {
+                        close_client(&clients, &master_fds, sckt, 
+                            sckt_to_msg, server2client, client2server);
+                    }
+                }
+                else
+                {
+                    // process as regular request
+                    req = Table_get(sckt_to_msg, Atom_int(sckt));
+                    if (!req)
+                    {
+                        req = HTTPMessage_new();
+                        Table_put(sckt_to_msg, Atom_int(sckt), req);
+                    }
+                    if (!read_sckt(sckt, req))
+                    {
+                        fprintf(stderr, "Bad request\n");
+                        close_client(&clients, &master_fds, sckt, sckt_to_msg,
+                            server2client, client2server);
                         continue;
                     }
-                    else
+                    else if (req->is_complete)
                     {
-                        fprintf(stderr, "Request processed\n");
-                        Table_put(sckt_to_msg, Atom_int(sckt), 
-                                  HTTPMessage_new());
-                        HTTPMessage_free(&req);
-                        close(server_fd);
+                        /*
+                        printf("\nRequest Header\n"); 
+                        printf("%s", req->start_line);
+                        HeaderFieldsList_print(req->header);
+                        printf("\n");*/ // TODO remove
+                        server_fd = process_req(req, sckt, &clients, cache, &https);
+                        if(server_fd <= 0)
+                        {
+                            close_client(&clients, &master_fds, sckt, 
+                                sckt_to_msg, server2client, client2server);
+                            continue;
+                        }
+                        else
+                        {
+                            //fprintf(stderr, "Request processed\n"); // TODO remove
+                            Table_put(sckt_to_msg, Atom_int(sckt), 
+                                    HTTPMessage_new());
+                            HTTPMessage_free(&req);
+                            if (https)
+                            {
+                                NEW0(server_fd_store);
+                                memcpy(server_fd_store, &sckt, 
+                                    sizeof(*server_fd_store));
+                                server_fd_store = Table_put(server2client, 
+                                    Atom_int(server_fd), server_fd_store);
+                                FREE(server_fd_store);
+
+                                NEW0(server_fd_store);
+                                memcpy(server_fd_store, &server_fd, 
+                                    sizeof(*server_fd_store));
+                                server_fd_store = Table_put(client2server,
+                                    Atom_int(sckt), server_fd_store);
+                                FREE(server_fd_store);
+                                FD_SET(server_fd, &master_fds);
+                                fdmax = MAX(server_fd, fdmax);
+                                printf("Added server connection %d\n", server_fd); // TODO remove
+                            }
+                            else
+                            {
+                                close(server_fd);
+                            }
+                        }
                     }
+                    if (!ClientList_keepalive(clients, sckt))
+                        close_client(&clients, &master_fds, sckt, sckt_to_msg,
+                            server2client, client2server);
                 }
-                if (!ClientList_keepalive(clients, sckt))
-                    close_client(&clients, &master_fds, sckt, sckt_to_msg);
             }
         }
     }

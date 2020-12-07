@@ -13,7 +13,7 @@
 #
 
 # Executables to built using "make all"
-EXECUTABLES = server_new
+EXECUTABLES = server
 TESTS = test_clientlist
 
 # Do all C compiles with gcc
@@ -66,13 +66,11 @@ tests: $(TESTS)
 #    Those .o files are linked together to build the corresponding
 #    executable.
 #
-server: a1.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o
-	$(CC) $(LDFLAGS) -o server a1.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o $(LDLIBS)
 
-server_local: a1.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o
-	$(CC) $(LDFLAGS) -o server a1.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o $(LDLIBS_LOCAL)
+server_local: a1.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o socketconn.o atom.o table.o cache.o
+	$(CC) $(LDFLAGS) -o server a1.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o socketconn.o atom.o table.o cache.o $(LDLIBS_LOCAL)
 
-server_new: server.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o socketconn.o atom.o table.o cache.o
+server: server.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o socketconn.o atom.o table.o cache.o
 	$(CC) $(LDFLAGS) -o server server.o list.o mem.o failure.o clientlist.o clientinfo.o headerfieldslist.o socketconn.o atom.o table.o cache.o $(LDLIBS)
 
 test_clientlist: clientlist_test.o clientlist.o clientinfo.o list.o mem.o failure.o

@@ -20,18 +20,18 @@ TESTS = test_clientlist
 CC = gcc
 
 # Updating include path to use current directory
-IFLAGS = -I.
+IFLAGS = -I/usr/include/python3.8
 
 # link against system software
-CFLAGS =  -g -Wall -Wextra $(IFLAGS)
-LIBS = -lnsl
+CFLAGS =  -g -Wall -Wextra $(IFLAGS) $(LIBS)
+LIBS = -lnsl -lpthread -lpython3.8
 
 # Linking flags, used in the linking step
 # Set debugging information and update linking path
 LDFLAGS = -g
 
 # Linking libraries
-LDLIBS = -lnsl
+LDLIBS = -lnsl -lpthread -lpython3.8
 LDLIBS_LOCAL = ""
 
 # 
@@ -40,7 +40,7 @@ LDLIBS_LOCAL = ""
 #    Note that "all" is the default target that make will build
 #    if nothing is specifically requested
 #
-all: $(EXECUTABLES)
+all: $(EXECUTABLES) $(LIBS)
 
 # 
 #    'make clean' will remove all object and executable files

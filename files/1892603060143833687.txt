@@ -1,0 +1,10 @@
+http://detectportal.firefox.com/success.txt
+Server: nginx
+Date: Wed, 09 Dec 2020 08:21:53 GMT
+Content-Type: text/plain
+Content-Length: 8
+Via: 1.1 google
+Cache-Control: public, must-revalidate, max-age=0, s-maxage=86400
+Age: 73992
+Connection: keep-alive
+sep

@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <Python.h>
 #include <time.h>
 #include <signal.h>
 #include <ctype.h>
@@ -35,17 +37,67 @@
 
 #define BUFF_SIZE 10240
 
-typedef struct HTTPMessage{
-    char *start_line;
-    HeaderFieldsList header;
-    char *body;
-    size_t content_len;
-    size_t body_remaining;
-    bool has_full_header;
-    bool is_complete;
-    char *unprocessed;
-    int bytes_unprocessed;
-} *HTTPMessage;
+void * launchServe()
+{
+    //temp is python filename
+    //method is specific funciton inside of python code we wish to call
+    char * temp = "search";
+    char * method = "launch";
+    //set the python environment
+    setenv("PYTHONPATH", ".", 0);
+
+    //must be called before all other Py functions
+    Py_Initialize();
+
+    PyObject *pValue;
+    PyObject *name = PyUnicode_DecodeFSDefault(temp);
+    //attempt to load the python program as a module
+    PyObject *pModule = PyImport_Import(name);
+    Py_DECREF(name);
+
+    if(pModule!=NULL)
+    {
+        //load the specific function from the python program
+        PyObject *pFunc = PyObject_GetAttrString(pModule, method);
+        //check if program is callable and exists
+        if(pFunc && PyCallable_Check(pFunc))
+        {
+
+            printf("Yeehaw\n");
+            //run the function in question, store return value
+            pValue = PyObject_CallObject(pFunc,NULL);
+
+            //print out a value if we got it
+            if (pValue != NULL) {
+                printf("Result of call: %ld\n", PyLong_AsLong(pValue));
+                Py_DECREF(pValue);
+            }
+            //error occured
+            else {
+                Py_DECREF(pFunc);
+                Py_DECREF(pModule);
+                PyErr_Print();
+                fprintf(stderr,"Call failed\n");
+                return NULL;
+            }
+        } //if function exists and is callable
+        else { 
+            if (PyErr_Occurred())
+                PyErr_Print();
+            fprintf(stderr, "Cannot find function launch \n");
+        }
+        Py_XDECREF(pFunc);
+        Py_DECREF(pModule);
+    }//if pmodule != NULL
+    else { //failed to find python source code
+        PyErr_Print();
+        fprintf(stderr, "Failed to load \"%s\"\n", temp);
+        return NULL;
+    }
+    if(Py_FinalizeEx() < 0)
+        exit(120);
+}
+
 
 typedef struct Directive{
     char *key;
@@ -811,6 +863,7 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
                         {
                             res_cached = true;
                             Cache_put(cache, url, res, secs_to_live);
+                            Cache_write_out(cache);
                         }
                     }
                 }
@@ -882,6 +935,8 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
     return ret_val;
 }
 
+
+
 int main(int argc, const char *argv[]) 
 {
     SocketConn parent, child; // parent and child socket connections
@@ -923,8 +978,16 @@ int main(int argc, const char *argv[])
     client2server = Table_new(expected_clients, NULL, NULL);
     cache = Cache_new(expected_clients);
 
+    int initsearch = 0;
+    pthread_t id;
     while(true)
     {
+        if(initsearch==0)
+        {
+            pthread_create(&id, NULL, launchServe, NULL);
+            printf("Launching search engine\n");
+            initsearch=1;
+        }
         for (sckt = 0; sckt <= fdmax; sckt++) 
             if (!ClientList_keepalive(clients, sckt))
                 close_client(&clients, &master_fds, sckt, sckt_to_msg, 
@@ -1064,5 +1127,6 @@ int main(int argc, const char *argv[])
     SocketConn_close(parent);
     SocketConn_free(&parent);
     SocketConn_free(&child);
+    pthread_cancel(id);
     return EXIT_SUCCESS;
 }

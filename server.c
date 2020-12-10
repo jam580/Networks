@@ -35,18 +35,52 @@
 
 #define BUFF_SIZE 10240
 
+typedef struct Chunk{
+    size_t len;
+    char *chunk;
+} *Chunk;
+
+Chunk Chunk_new()
+{
+    Chunk c;
+    NEW(c);
+    c->len = 0;
+    c->chunk = NULL;
+    return c;
+}
+
+void Chunk_print(Chunk c)
+{
+    size_t i;
+    for (i = 0; i < c->len; i++)
+        printf("%c", *(c->chunk + i));
+}
+
+void Chunk_free(Chunk *c)
+{
+    FREE((*c)->chunk);
+    FREE(*c);
+    *c = NULL;
+}
+
 typedef struct HTTPMessage{
     char *start_line;
     char *start_line_elts[3];
     HeaderFieldsList header;
+    HeaderFieldsList trailer;
     char *body;
+    List_T chunks;
     size_t content_len;
     size_t body_remaining;
     bool has_full_header;
     bool is_complete;
     char *unprocessed;
     int bytes_unprocessed;
+    int type;
 } *HTTPMessage;
+#define NOT_SPECIFIED 0
+#define REQUEST 1
+#define RESPONSE 2
 
 typedef struct Directive{
     char *key;
@@ -62,20 +96,25 @@ HTTPMessage HTTPMessage_new()
     for (i = 0; i < 3; i++)
         (msg->start_line_elts)[i] = NULL;
     msg->header = HeaderFieldsList_new();
+    msg->trailer = HeaderFieldsList_new();
     msg->body = NULL;
+    msg->chunks = NULL;
     msg->content_len = 0;
     msg->body_remaining = 0;
     msg->has_full_header = false;
     msg->is_complete = false;
     msg->unprocessed = NULL;
     msg->bytes_unprocessed = 0;
+    msg->type = NOT_SPECIFIED;
     return msg;
 }
 
 void HTTPMessage_free(HTTPMessage *httpmsg)
 {
     HTTPMessage msg = *httpmsg;
+    Chunk c;
     int i;
+    List_T head;
     if (msg->header != NULL)
         HeaderFieldsList_free(&(msg->header));
     if (msg->start_line != NULL)
@@ -87,6 +126,18 @@ void HTTPMessage_free(HTTPMessage *httpmsg)
         FREE(msg->body);
     if (msg->unprocessed != NULL)
         FREE(msg->unprocessed);
+    if (msg->chunks != NULL)
+    {
+        head = msg->chunks;
+        for (; head; head = head->rest)
+        {
+            c = head->first;
+            Chunk_free(&c);
+        }
+        List_free(&(msg->chunks));
+    }
+    if (msg->trailer != NULL)
+        HeaderFieldsList_free(&(msg->trailer));
     FREE(*httpmsg);
 }
 
@@ -138,6 +189,8 @@ bool write_msg(HTTPMessage msg, int sckt)
     int bytes;
     char *field;
     HeaderFieldsList header;
+    List_T chunks;
+    Chunk c;
 
     assert(msg && msg->is_complete);
     bytes = write(sckt, msg->start_line, strlen(msg->start_line));
@@ -162,9 +215,80 @@ bool write_msg(HTTPMessage msg, int sckt)
         bytes = write(sckt, msg->body, msg->content_len);
         if (bytes <= 0)
             return false;
+    } else if (msg->chunks != NULL)
+    {
+        chunks = msg->chunks;
+        for (; chunks; chunks = chunks->rest)
+        {
+            c = chunks->first;
+            bytes = write(sckt, c->chunk, c->len);
+            if (bytes <= 0)
+                return false;
+        }
+        header = msg->trailer;
+        for (; header != NULL; header = header->rest)
+        {
+            field = header->first;
+            bytes = write(sckt, field, strlen(field));
+            if (bytes <= 0)
+                return false;
+        }
+        bytes = write(sckt, "\r\n", 2); // new line end of payload
     }
     
     return true;
+}
+
+/*
+ * Function: get_directives
+ * ------------------------
+ * Extracts the directives from the header field and returns them as an array
+ * of directives.
+ * 
+ * field: header field
+ * start: start position of directives
+ * max: maximum number of directives to extract
+ * dirs: array to store Directives in
+ */
+int get_directives(char *field, int start, int max, Directive dirs[])
+{
+    int stop, i;
+    char tmp;
+    bool more_directives;
+
+    more_directives = true;
+    for (i = 0; i < max && more_directives; i++)
+    {
+        while (field[start] == ' ') { start++; }
+        stop = start;
+        while (field[stop] != '=' && field[stop] != ',' &&
+               field[stop] != '\r' && field[stop] != '\n') 
+        { 
+            stop++; 
+        }
+
+        tmp = field[stop];
+        field[stop] = '\0';
+        dirs[i].key = strdup(field+start);
+        field[stop] = tmp;
+
+        if (field[stop] == '=')
+        {
+            start = ++stop;
+            while (field[stop] != ',' && field[stop] != '\r' && field[stop] != '\n')
+                stop++;
+
+            tmp = field[stop];
+            field[stop] = '\0';
+            dirs[i].value = strdup(field+start);
+            field[stop] = tmp;
+        }
+        
+        if (field[stop] != ',')
+            more_directives = false;
+        start = stop + 1;
+    }
+    return i;
 }
 
 /*
@@ -254,6 +378,99 @@ int extract_body(char *body, int bytes, HTTPMessage msg)
 }
 
 /*
+ * Get the first chunk from body, if possible, and update stored body in msg.
+ * Returns chunk_data size
+ */
+int get_chunk(char **body, int *bytes, HTTPMessage msg)
+{
+    Chunk c;
+    size_t chunk_size_len, chunk_data_bytes;
+    char *chunk_size, *end_ptr;
+
+    chunk_size = get_line(body, bytes);
+    if (chunk_size != NULL)
+    {
+        chunk_size_len = strlen(chunk_size);
+        chunk_data_bytes = strtoul(chunk_size, &end_ptr, 10);
+        if (chunk_data_bytes == 0)
+        {
+            c = Chunk_new();
+            c->chunk = chunk_size;
+            c->len = chunk_size_len;
+            msg->chunks = List_append(msg->chunks, List_push(NULL, c));
+            msg->body_remaining = 0;
+        }
+        else if ((size_t)*bytes >= chunk_data_bytes + 2)
+        {
+            c = Chunk_new();
+            c->chunk = calloc(chunk_size_len + chunk_data_bytes + 2, 1);
+            memcpy(c->chunk, chunk_size, chunk_size_len);
+            memcpy(c->chunk + chunk_size_len, *body, chunk_data_bytes + 2);
+            c->len = chunk_size_len + chunk_data_bytes + 2;
+            *body += chunk_data_bytes + 2;
+            *bytes -= (chunk_data_bytes + 2);
+            msg->chunks = List_append(msg->chunks, List_push(NULL, c));
+            FREE(chunk_size);
+        }
+        else
+            FREE(chunk_size);
+        return chunk_data_bytes;
+    }
+
+    return 0;
+}
+
+/*
+ * Function: extract_body_chunked
+ * ------------------------------
+ *   Extracts up to bytes given of body and stores in msg. Body is assumed to
+ *   be chunked. Returns the number of bytes remaining in the given body that
+ *   could not be processed.
+ * 
+ *   msg->body_remaining MUST be non-zero for the body to be processed.
+ */
+int extract_body_chunked(char *body, int bytes, HTTPMessage msg)
+{
+    char *body_dup, *line;
+    int bytes_dup, bytes_prev, bytes_processed;
+
+    body_dup = body;
+    bytes_dup = bytes;
+    bytes_processed = 0;
+    bytes_prev = bytes_dup;
+    while (get_chunk(&body_dup, &bytes_dup, msg) != 0) 
+    {
+        bytes_processed += (bytes_prev - bytes_dup);
+        bytes_prev = bytes_dup;
+    }
+    bytes_processed += (bytes_prev - bytes_dup);
+
+    if (msg->body_remaining == 0)
+    {
+        msg->body_remaining = 1;
+        bytes_prev = bytes_dup;
+        while ((line = get_line(&body_dup, &bytes_dup)) != NULL)
+        {
+            if (strcmp(line, "\r\n") == 0)
+            {
+                msg->body_remaining = 0;
+                bytes_processed += bytes_prev - bytes_dup;
+                FREE(line);
+                break;
+            }
+            else
+            {
+                msg->trailer = HeaderFieldsList_push(msg->trailer, line);
+                bytes_processed += bytes_prev - bytes_dup;
+            }
+            bytes_prev = bytes_dup;
+        }
+    }
+
+    return bytes - bytes_processed;
+}
+
+/*
  * Function: get_content_len
  * -------------------------
  *   Returns the content length, as specified in the header.
@@ -268,6 +485,43 @@ size_t get_content_len(HeaderFieldsList header)
 }
 
 /*
+ * Determines whether the message associated with the given header contains
+ * a chunked body, as specified by the "Transfer-Encoding" header. 
+ * (RFC 7230 Section 3.3.1, pg. 28)
+ */
+bool is_chunked(HeaderFieldsList header)
+{
+    char *field;
+    Directive dirs[5];
+    int i, num_dirs;
+    bool retval;
+
+    for (i = 0; i < 5; i++)
+    {
+        dirs[i].key = NULL;
+        dirs[i].value = NULL;
+    }
+    field = HeaderFieldsList_get(header, "Transfer-Encoding");
+    if (field != NULL)
+    {
+        num_dirs = get_directives(field, strlen("transfer-encoding:"), 5, dirs);
+        if (num_dirs > 0)
+            retval = strcasecmp(dirs[num_dirs-1].key, "chunked") == 0;
+        else
+            retval = false;
+    }
+    else
+        retval = false;
+
+    for (i = 0; i < 5; i++)
+    {
+        FREE(dirs[i].key);
+        FREE(dirs[i].value);
+    }
+    return retval;
+}
+
+/*
  * Function: read_sckt
  * -------------------
  *   Reads a request or response from the client at given socket and stores
@@ -277,9 +531,11 @@ size_t get_content_len(HeaderFieldsList header)
  */
 bool read_sckt(int sckt, HTTPMessage msg)
 {
-    int bytes;
+    int bytes, new_bytes;
     char *buf, *buf_dup;
     size_t content_len;
+
+    assert(msg->type != NOT_SPECIFIED); // critical failure if not specified
 
     buf = malloc(BUFF_SIZE);
     if (msg->bytes_unprocessed > 0)
@@ -306,33 +562,78 @@ bool read_sckt(int sckt, HTTPMessage msg)
 
     if (msg->has_full_header)
     {
-        content_len = get_content_len(msg->header);
-        msg->content_len = content_len;
-        if (content_len > 0)
+        if (HeaderFieldsList_get(msg->header, "Transfer-Encoding") != NULL)
         {
-            if (msg->body == NULL)
+            // remove content-length if present to prevent request smuggling
+            // RFC 7230, 3.3.3, #3
+            msg->header = 
+                HeaderFieldsList_remove(msg->header, "Content-Length");
+            msg->content_len = 0;
+            printf("Has Transfer Encoding\n"); // TODO remove
+            if (is_chunked(msg->header))
             {
-                msg->body_remaining = content_len;
-                msg->body = calloc(content_len, sizeof(*(msg->body)));
+                printf("Chunked\n"); // TODO remove
+                msg->body_remaining = 1;
+                new_bytes = extract_body_chunked(buf, bytes, msg);
+                if (msg->body_remaining == 0)
+                {
+                    msg->is_complete = true;
+                    if (new_bytes > 0)
+                        return false;
+                }
+                else if (new_bytes > 0)
+                {
+                    msg->unprocessed = malloc(new_bytes);
+                    memcpy(msg->unprocessed, 
+                            buf + (bytes - new_bytes),
+                            new_bytes);
+                    msg->bytes_unprocessed = bytes;
+                }
             }
-            bytes = extract_body(buf, bytes, msg);
-            if (msg->body_remaining == 0)
+            else if (msg->type == RESPONSE)
+            {
+                printf("Response with transfer encoding but not chunked\n");
+                // TODO process body until connection is closed
+            }
+            else if (msg->type == REQUEST)
+            {
+                printf("Request with transfer encoding but not chunked\n");
+                FREE(buf_dup);
+                return false;
+            }
+            //exit(EXIT_SUCCESS);
+        }
+        else
+        {
+            printf("Does not have transfer-encoding\n"); // TODO remove
+            content_len = get_content_len(msg->header);
+            msg->content_len = content_len;
+            if (content_len > 0)
+            {
+                if (msg->body == NULL)
+                {
+                    msg->body_remaining = content_len;
+                    msg->body = calloc(content_len, sizeof(*(msg->body)));
+                }
+                bytes = extract_body(buf, bytes, msg);
+                if (msg->body_remaining == 0)
+                {
+                    msg->is_complete = true;
+                    if (bytes > 0)
+                    {
+                        //printf("content read but still has more bytes"); // TODO remove
+                        return false;
+                    }
+                }
+            }
+            else
             {
                 msg->is_complete = true;
                 if (bytes > 0)
                 {
-                    //printf("content read but still has more bytes"); // TODO remove
+                    //printf("no content but still has more bytes"); // TODO remove
                     return false;
                 }
-            }
-        }
-        else
-        {
-            msg->is_complete = true;
-            if (bytes > 0)
-            {
-                //printf("no content but still has more bytes"); // TODO remove
-                return false;
             }
         }
     }
@@ -516,58 +817,6 @@ bool get_res(HTTPMessage req, HTTPMessage res, int server)
         return false;
 
     return true;
-}
-
-/*
- * Function: get_directives
- * ------------------------
- * Extracts the directives from the header field and returns them as an array
- * of directives.
- * 
- * field: header field
- * start: start position of directives
- * max: maximum number of directives to extract
- * dirs: array to store Directives in
- */
-int get_directives(char *field, int start, int max, Directive dirs[])
-{
-    int stop, i;
-    char tmp;
-    bool more_directives;
-
-    more_directives = true;
-    for (i = 0; i < max && more_directives; i++)
-    {
-        while (field[start] == ' ') { start++; }
-        stop = start;
-        while (field[stop] != '=' && field[stop] != ',' &&
-               field[stop] != '\r' && field[stop] != '\n') 
-        { 
-            stop++; 
-        }
-
-        tmp = field[stop];
-        field[stop] = '\0';
-        dirs[i].key = strdup(field+start);
-        field[stop] = tmp;
-
-        if (field[stop] == '=')
-        {
-            start = ++stop;
-            while (field[stop] != ',' && field[stop] != '\r' && field[stop] != '\n')
-                stop++;
-
-            tmp = field[stop];
-            field[stop] = '\0';
-            dirs[i].value = strdup(field+start);
-            field[stop] = tmp;
-        }
-        
-        if (field[stop] != ',')
-            more_directives = false;
-        start = stop + 1;
-    }
-    return i;
 }
 
 void process_keep_alive(ClientList *clients, int client, char *field)
@@ -848,6 +1097,7 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
                 {
                     res_cached = false;
                     res = HTTPMessage_new();
+                    res->type = RESPONSE;
                     if (!get_res(req, res, server_fd))
                     {
                         close(server_fd);
@@ -923,7 +1173,7 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
         FREE(port);
         FREE(path);
     }
-    
+
     return ret_val;
 }
 
@@ -934,7 +1184,7 @@ int main(int argc, const char *argv[])
     int fdmax; // highest socket number
     int sckt; // socket loop counter
     ClientList clients; // list of client connections
-    HTTPMessage req;
+    HTTPMessage req, res;
     Table_T sckt_to_msg, server2client, client2server;
     int expected_clients; // expected number of concurrent clients
     int server_fd, *server_fd_store, *https_sckt;
@@ -1036,8 +1286,18 @@ int main(int argc, const char *argv[])
                         req = HTTPMessage_new();
                         Table_put(sckt_to_msg, Atom_int(sckt), req);
                     }
+                    req->type = REQUEST;
                     if (!read_sckt(sckt, req))
                     {
+                        res = HTTPMessage_new();
+                        res->start_line = 
+                            strdup("HTTP/1.1 400 Bad Request\r\n");
+                        res->header = HeaderFieldsList_push(res->header,
+                            strdup("Connection: close\r\n"));
+                        res->has_full_header = true;
+                        res->is_complete = true;
+                        write_msg(res, sckt);
+                        HTTPMessage_free(&res);
                         fprintf(stderr, "Bad request\n");
                         close_client(&clients, &master_fds, sckt, sckt_to_msg,
                             server2client, client2server);

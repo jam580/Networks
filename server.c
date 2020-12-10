@@ -37,6 +37,7 @@
 
 typedef struct HTTPMessage{
     char *start_line;
+    char *start_line_elts[3];
     HeaderFieldsList header;
     char *body;
     size_t content_len;
@@ -55,8 +56,11 @@ typedef struct Directive{
 HTTPMessage HTTPMessage_new()
 {
     HTTPMessage msg;
+    int i;
     NEW(msg);
     msg->start_line = NULL;
+    for (i = 0; i < 3; i++)
+        (msg->start_line_elts)[i] = NULL;
     msg->header = HeaderFieldsList_new();
     msg->body = NULL;
     msg->content_len = 0;
@@ -71,10 +75,14 @@ HTTPMessage HTTPMessage_new()
 void HTTPMessage_free(HTTPMessage *httpmsg)
 {
     HTTPMessage msg = *httpmsg;
+    int i;
     if (msg->header != NULL)
         HeaderFieldsList_free(&(msg->header));
     if (msg->start_line != NULL)
         FREE(msg->start_line);
+    for (i = 0; i < 3; i++)
+        if ((msg->start_line_elts)[i] != NULL)
+            FREE((msg->start_line_elts)[i]);
     if (msg->body != NULL)
         FREE(msg->body);
     if (msg->unprocessed != NULL)
@@ -100,7 +108,7 @@ void close_client(ClientList *clients, fd_set *master_fds, int sckt,
     HTTPMessage msg;
     int *server_stored, *client_stored;
 
-    //printf("Closing connection %d\n", sckt); // TODO remove
+    printf("Closing connection %d\n", sckt); // TODO remove
     FD_CLR(sckt, master_fds);
     *clients = ClientList_remove(*clients, sckt);
     msg = Table_get(sckt_to_msg, Atom_int(sckt));
@@ -343,16 +351,47 @@ bool read_sckt(int sckt, HTTPMessage msg)
 /*
  * Function: explode_start_line
  * ----------------------------
- *   Split the start line into 
+ *   Split the start line in the given msg into
  *   a) the method, the request-target, and the protocol for requests or 
  *   b) the protocol, code, and phrase for responses.
- *   More infor in RFC 7230, pg. 21. Max length of each pointer given by len.
+ * 
+ *   Updates the elements in the given message if the explosion was successful.
+ *   Note, there is no exffect when providing a request that contains non-null
+ *   elements. It is assumed that such a message has already been exploded. It
+ *   is a checked runtime error to provide an msg with a NULL start_line.
+ * 
+ *   More info in RFC 7230, pg. 21.
  * 
  *   Returns false on failure and true otherwise.
  */
-bool explode_start_line(char *line, char *m, char *u, char *p)
+bool explode_start_line(HTTPMessage msg)
 {
-    return sscanf(line, "%s %s %s", m, u, p);
+    char *elts[3];
+    size_t line_len;
+    int i;
+
+    assert(msg->start_line);
+
+    if ((msg->start_line_elts)[0])
+        return 0;
+    
+    line_len = strlen(msg->start_line);
+    for (i = 0; i < 3; i++)
+        elts[i] = calloc(line_len, sizeof(**elts));
+    
+    if (sscanf(msg->start_line, "%s %s %s", elts[0], elts[1], elts[2]) == 3)
+    {
+        for (i = 0; i < 3; i++)
+            (msg->start_line_elts)[i] = elts[i];
+        return true;
+    }
+    else
+    {
+        printf("NO ELTS\n");
+        for (i = 0; i < 3; i++)
+            FREE(elts[i]);
+        return false;
+    }
 }
 
 /*
@@ -660,54 +699,66 @@ bool should_cache(HTTPMessage res, int *secs_to_live)
     s_max_age_set = false;
     num_dirs = get_directives(field, strlen("cache-control:"), 10, dirs);
 
-    protocol = calloc(strlen(res->start_line), 1);
-    code = calloc(strlen(res->start_line), 1);
-    reason = calloc(strlen(res->start_line), 1);
-    explode_start_line(res->start_line, protocol, code, reason);
-    code_num = atoi(code);
-    if (code_num != 200 && code_num != 203 && code_num != 204 && 
-        code_num != 206 && code_num != 300 && code_num != 301 && 
-        code_num != 404 && code_num != 405 && code_num != 410 && 
-        code_num != 414 && code_num != 501)
-        cacheable = false;
-
-    for (i = 0; i < num_dirs; i++)
+    if (explode_start_line(res))
     {
-        if (strcasecmp("no-store", dirs[i].key) == 0)
-        {
+        protocol = (res->start_line_elts)[0];
+        code = (res->start_line_elts)[1];
+        reason = (res->start_line_elts)[2];
+        (void)reason; // remove unused variable warning.
+        (void)protocol; // remove unused variable warning.
+    }
+    else
+    {
+        protocol = NULL;
+        code = NULL;
+        reason = NULL;
+    }
+
+    if (code != NULL)
+    {
+        code_num = atoi(code);
+        if (code_num != 200 && code_num != 203 && code_num != 204 && 
+            code_num != 206 && code_num != 300 && code_num != 301 && 
+            code_num != 404 && code_num != 405 && code_num != 410 && 
+            code_num != 414 && code_num != 501)
             cacheable = false;
-            break;
-        }
-        else if (strcasecmp("private", dirs[i].key) == 0)
+
+        for (i = 0; i < num_dirs; i++)
         {
-            cacheable = false;
-            break;
-        }
-        else if (strcasecmp("public", dirs[i].key) == 0)
-        {
-            cacheable = true;
-        }
-        else if (strcasecmp("max-age", dirs[i].key) == 0)
-        {
-            if (!s_max_age_set)
+            if (strcasecmp("no-store", dirs[i].key) == 0)
+            {
+                cacheable = false;
+                break;
+            }
+            else if (strcasecmp("private", dirs[i].key) == 0)
+            {
+                cacheable = false;
+                break;
+            }
+            else if (strcasecmp("public", dirs[i].key) == 0)
+            {
+                cacheable = true;
+            }
+            else if (strcasecmp("max-age", dirs[i].key) == 0)
+            {
+                if (!s_max_age_set)
+                    *secs_to_live = atoi(dirs[i].value);
+            }
+            if (strcasecmp("s-maxage", dirs[i].key) == 0)
+            {
+                s_max_age_set = true;
                 *secs_to_live = atoi(dirs[i].value);
-        }
-        if (strcasecmp("s-maxage", dirs[i].key) == 0)
-        {
-            s_max_age_set = true;
-            *secs_to_live = atoi(dirs[i].value);
+            }
         }
     }
+    else
+        cacheable = false;
 
     for (i = 0; i < 10; i++)
     {
         FREE(dirs[i].key);
         FREE(dirs[i].value);
     }
-
-    FREE(protocol);
-    FREE(code);
-    FREE(reason);
     return cacheable;
 }
 
@@ -759,29 +810,27 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
     int ret_val;
     char *method, *url, *protocol;
     char *host, *port, *path;
-    size_t line_len, url_len;
+    size_t url_len;
     int server_fd;
     HTTPMessage res;
     int secs_to_live, age;
     char *age_hdr;
     bool res_cached;
 
-    line_len = strlen(req->start_line);
-    method = calloc(line_len, sizeof(*method));
-    url = calloc(line_len, sizeof(*url));
-    protocol = calloc(line_len, sizeof(*protocol));
-
     ret_val = -1;
-    if (explode_start_line(req->start_line, method, url, protocol) && 
-        method_is_supported(method))
+    if (explode_start_line(req) && 
+        method_is_supported((req->start_line_elts)[0]))
     {
+        method = (req->start_line_elts)[0];
+        url = (req->start_line_elts)[1];
+        protocol = (req->start_line_elts)[2];
         url_len = strlen(url);
         host = calloc(url_len, sizeof(*host));
         port = calloc(url_len, sizeof(*port));
         path = calloc(url_len, sizeof(*path));
         explode_url(url, host, port, path);
 
-        if (url[0] != '\0')
+        if (host[0] != '\0')
         {
             if (port[0] == '\0')
                 strcpy(port, "80");
@@ -854,11 +903,10 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
                     res->header = HeaderFieldsList_push(res->header, 
                         strdup("Connection: close\r\n"));
 
-                /*
                 printf("Response Header:\n");
                 printf("%s", res->start_line);
                 HeaderFieldsList_print(res->header);
-                printf("\n");*/ // TODO remove
+                printf("\n"); // TODO remove
                 
                 if (!write_msg(res, client))
                 {
@@ -876,9 +924,6 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
         FREE(path);
     }
     
-    FREE(method);
-    FREE(url);
-    FREE(protocol);
     return ret_val;
 }
 
@@ -1000,11 +1045,10 @@ int main(int argc, const char *argv[])
                     }
                     else if (req->is_complete)
                     {
-                        /*
                         printf("\nRequest Header\n"); 
                         printf("%s", req->start_line);
                         HeaderFieldsList_print(req->header);
-                        printf("\n");*/ // TODO remove
+                        printf("\n"); // TODO remove
                         server_fd = process_req(req, sckt, &clients, cache, &https);
                         if(server_fd <= 0)
                         {
@@ -1014,7 +1058,7 @@ int main(int argc, const char *argv[])
                         }
                         else
                         {
-                            //fprintf(stderr, "Request processed\n"); // TODO remove
+                            //printf("Request processed\n"); // TODO remove
                             Table_put(sckt_to_msg, Atom_int(sckt), 
                                     HTTPMessage_new());
                             HTTPMessage_free(&req);

@@ -159,7 +159,7 @@ void close_client(ClientList *clients, fd_set *master_fds, int sckt,
     HTTPMessage msg;
     int *server_stored, *client_stored;
 
-    printf("Closing connection %d\n", sckt); // TODO remove
+    //printf("Closing connection %d\n", sckt); // TODO remove
     FD_CLR(sckt, master_fds);
     *clients = ClientList_remove(*clients, sckt);
     msg = Table_get(sckt_to_msg, Atom_int(sckt));
@@ -326,6 +326,52 @@ char *get_line(char **buf, int *bytes)
         *bytes = *bytes - line_len;
     }
     return line;
+}
+
+/*
+ * Function: explode_start_line
+ * ----------------------------
+ *   Split the start line in the given msg into
+ *   a) the method, the request-target, and the protocol for requests or 
+ *   b) the protocol, code, and phrase for responses.
+ * 
+ *   Updates the elements in the given message if the explosion was successful.
+ *   Note, there is no exffect when providing a request that contains non-null
+ *   elements. It is assumed that such a message has already been exploded. It
+ *   is a checked runtime error to provide an msg with a NULL start_line.
+ * 
+ *   More info in RFC 7230, pg. 21.
+ * 
+ *   Returns false on failure and true otherwise.
+ */
+bool explode_start_line(HTTPMessage msg)
+{
+    char *elts[3];
+    size_t line_len;
+    int i;
+
+    assert(msg->start_line);
+
+    if ((msg->start_line_elts)[0])
+        return true;
+    
+    line_len = strlen(msg->start_line);
+    for (i = 0; i < 3; i++)
+        elts[i] = calloc(line_len, sizeof(**elts));
+    
+    if (sscanf(msg->start_line, "%s %s %s", elts[0], elts[1], elts[2]) == 3)
+    {
+        for (i = 0; i < 3; i++)
+            (msg->start_line_elts)[i] = elts[i];
+        return true;
+    }
+    else
+    {
+        printf("NO ELTS\n");
+        for (i = 0; i < 3; i++)
+            FREE(elts[i]);
+        return false;
+    }
 }
 
 /*
@@ -522,21 +568,53 @@ bool is_chunked(HeaderFieldsList header)
 }
 
 /*
+ * Function: header_only
+ * ---------------------
+ *   Determine whether the given response message only contains a header based
+ *   on the response code. Some headers may have body length headers specified
+ *   but do not contain a body. It is an checked runtime error to provide
+ *   a request message instead of a response message, to provide a response that 
+ *   does not contain a startline, or to provide a response with an invalid
+ *   start line.
+ * 
+ *   Codes that MAY contain header fields for body length but do not contain a
+ *   body: 1xx, 204, 304 (RFC 7230 pg. 32)
+ */
+bool header_only(HTTPMessage res)
+{
+    char *code;
+    int code_num;
+    assert(res->start_line);
+    assert(explode_start_line(res));
+    assert(res->type == RESPONSE);
+    code = (res->start_line_elts)[1];
+    code_num = atoi(code);
+    return code_num / 100 == 1 || code_num == 204 || code_num == 304;
+}
+
+/*
  * Function: read_sckt
  * -------------------
  *   Reads a request or response from the client at given socket and stores
  *   the message in the given HTTPMessage.
  *   
+ *   sckt: the socket to read from
+ *   msg: Where to store the read message
+ *   no_body: whether the message is expected to not have a body. E.g. a
+ *      response to a HEAD req should have no_body set to true.
+ *   
  *   Returns false if the read failed and true otherwise;
  */
-bool read_sckt(int sckt, HTTPMessage msg)
+bool read_sckt(int sckt, HTTPMessage msg, bool no_body)
 {
     int bytes, new_bytes;
     char *buf, *buf_dup;
     size_t content_len;
+    bool connection_closed;
 
     assert(msg->type != NOT_SPECIFIED); // critical failure if not specified
 
+    connection_closed = false;
     buf = malloc(BUFF_SIZE);
     if (msg->bytes_unprocessed > 0)
         memcpy(buf, msg->unprocessed, msg->bytes_unprocessed);
@@ -544,12 +622,13 @@ bool read_sckt(int sckt, HTTPMessage msg)
     bytes = read(sckt, 
                  buf + msg->bytes_unprocessed, 
                  BUFF_SIZE - msg->bytes_unprocessed);
-    if (bytes <= 0)
+    if (bytes < 0)
     {
-        //printf("bad read\n"); // TODO remove
         FREE(buf);
         return false;
     }
+    else if(bytes == 0)
+        connection_closed = true;
     else
     {
         bytes += msg->bytes_unprocessed;
@@ -562,17 +641,23 @@ bool read_sckt(int sckt, HTTPMessage msg)
 
     if (msg->has_full_header)
     {
-        if (HeaderFieldsList_get(msg->header, "Transfer-Encoding") != NULL)
+        if (msg->type == RESPONSE && !no_body)
+            no_body = header_only(msg);
+        if (no_body)
+        {
+            msg->is_complete = true;
+            if (bytes > 0)
+                return false;
+        }
+        else if (HeaderFieldsList_get(msg->header, "Transfer-Encoding") != NULL)
         {
             // remove content-length if present to prevent request smuggling
             // RFC 7230, 3.3.3, #3
             msg->header = 
                 HeaderFieldsList_remove(msg->header, "Content-Length");
             msg->content_len = 0;
-            printf("Has Transfer Encoding\n"); // TODO remove
-            if (is_chunked(msg->header))
+            if (is_chunked(msg->header) && !connection_closed)
             {
-                printf("Chunked\n"); // TODO remove
                 msg->body_remaining = 1;
                 new_bytes = extract_body_chunked(buf, bytes, msg);
                 if (msg->body_remaining == 0)
@@ -592,20 +677,24 @@ bool read_sckt(int sckt, HTTPMessage msg)
             }
             else if (msg->type == RESPONSE)
             {
-                printf("Response with transfer encoding but not chunked\n");
-                // TODO process body until connection is closed
-            }
-            else if (msg->type == REQUEST)
-            {
-                printf("Request with transfer encoding but not chunked\n");
+                // TODO read until connection is closed
+                // just reject the response for now.
                 FREE(buf_dup);
                 return false;
             }
-            //exit(EXIT_SUCCESS);
+            else if (msg->type == REQUEST)
+            {
+                FREE(buf_dup);
+                return false;
+            }
         }
         else
         {
-            printf("Does not have transfer-encoding\n"); // TODO remove
+            if (connection_closed)
+            {
+                FREE(buf_dup);
+                return false;
+            }
             content_len = get_content_len(msg->header);
             msg->content_len = content_len;
             if (content_len > 0)
@@ -620,22 +709,21 @@ bool read_sckt(int sckt, HTTPMessage msg)
                 {
                     msg->is_complete = true;
                     if (bytes > 0)
-                    {
-                        //printf("content read but still has more bytes"); // TODO remove
                         return false;
-                    }
                 }
             }
             else
             {
                 msg->is_complete = true;
                 if (bytes > 0)
-                {
-                    //printf("no content but still has more bytes"); // TODO remove
                     return false;
-                }
             }
         }
+    }
+    else if (connection_closed)
+    {
+        FREE(buf_dup);
+        return false;
     }
     
     if (bytes > 0)
@@ -647,52 +735,6 @@ bool read_sckt(int sckt, HTTPMessage msg)
     
     FREE(buf_dup);
     return true;
-}
-
-/*
- * Function: explode_start_line
- * ----------------------------
- *   Split the start line in the given msg into
- *   a) the method, the request-target, and the protocol for requests or 
- *   b) the protocol, code, and phrase for responses.
- * 
- *   Updates the elements in the given message if the explosion was successful.
- *   Note, there is no exffect when providing a request that contains non-null
- *   elements. It is assumed that such a message has already been exploded. It
- *   is a checked runtime error to provide an msg with a NULL start_line.
- * 
- *   More info in RFC 7230, pg. 21.
- * 
- *   Returns false on failure and true otherwise.
- */
-bool explode_start_line(HTTPMessage msg)
-{
-    char *elts[3];
-    size_t line_len;
-    int i;
-
-    assert(msg->start_line);
-
-    if ((msg->start_line_elts)[0])
-        return 0;
-    
-    line_len = strlen(msg->start_line);
-    for (i = 0; i < 3; i++)
-        elts[i] = calloc(line_len, sizeof(**elts));
-    
-    if (sscanf(msg->start_line, "%s %s %s", elts[0], elts[1], elts[2]) == 3)
-    {
-        for (i = 0; i < 3; i++)
-            (msg->start_line_elts)[i] = elts[i];
-        return true;
-    }
-    else
-    {
-        printf("NO ELTS\n");
-        for (i = 0; i < 3; i++)
-            FREE(elts[i]);
-        return false;
-    }
 }
 
 /*
@@ -756,6 +798,8 @@ void explode_url(char *url, char *host, char *port, char *path)
 bool method_is_supported(char *meth)
 {
     return strcmp(meth, "GET") == 0 ||
+           strcmp(meth, "HEAD") == 0 ||
+           strcmp(meth, "POST") == 0 ||
            strcmp(meth, "CONNECT") == 0;
 }
 
@@ -811,7 +855,8 @@ bool get_res(HTTPMessage req, HTTPMessage res, int server)
     if(!write_msg(req, server))
         return false;
 
-    while (!res->is_complete && read_sckt(server, res)) {}
+    while (!res->is_complete && 
+        read_sckt(server, res, strncmp(req->start_line, "HEAD", 4) == 0)) {}
 
     if (!res->is_complete)
         return false;
@@ -1028,18 +1073,12 @@ bool tunnel(int from, int to)
     buf = malloc(BUFF_SIZE);
     read_bytes = read(from, buf, BUFF_SIZE);
     if (read_bytes <= 0)
-    {
-        //printf("bad read tunnel error %d\n", errno); // TODO remove
         ret_val = false;
-    }
     else
     {
         write_bytes = write(to, buf, read_bytes);
         if (write_bytes <= 0)
-        {
-            //printf("bad write tunnel %d\n", errno); // TODO remove
             ret_val = false;
-        }
     }
 
     FREE(buf);
@@ -1087,11 +1126,16 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
             server_fd = build_server_conn(host, port);
             ret_val = server_fd;
             res = NULL;
-            if (server_fd >= 0 && strcmp(method, "GET") == 0)
+            if (server_fd >= 0 && (strcmp(method, "GET") == 0 ||
+                                   strcmp(method, "HEAD") == 0 ||
+                                   strcmp(method, "POST") == 0))
             {
                 *https = false;
                 process_connection_header(req, protocol, client, clients);
-                res = Cache_get(cache, url, &age);
+                if (strcmp(method, "GET") == 0)
+                    res = Cache_get(cache, url, &age);
+                else
+                    res = NULL;
                 
                 if (res == NULL)
                 {
@@ -1106,7 +1150,8 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
                     else
                     {
                         secs_to_live = 0;
-                        if (should_cache(res, &secs_to_live))
+                        if (should_cache(res, &secs_to_live) &&
+                            strcmp(method, "GET") == 0 && res->body)
                         {
                             res_cached = true;
                             Cache_put(cache, url, res, secs_to_live);
@@ -1153,10 +1198,10 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
                     res->header = HeaderFieldsList_push(res->header, 
                         strdup("Connection: close\r\n"));
 
-                printf("Response Header:\n");
-                printf("%s", res->start_line);
-                HeaderFieldsList_print(res->header);
-                printf("\n"); // TODO remove
+                //printf("Response Header:\n");
+                //printf("%s", res->start_line);
+                //HeaderFieldsList_print(res->header);
+                //printf("\n"); // TODO remove
                 
                 if (!write_msg(res, client))
                 {
@@ -1227,7 +1272,7 @@ int main(int argc, const char *argv[])
 
         read_fds = master_fds;
 
-        printf("Waiting for socket to be ready\n"); // TODO remove
+        //printf("Waiting for socket to be ready\n"); // TODO remove
         if (select(fdmax+1, &read_fds, NULL, NULL, NULL) < 0)
             exit_failure("ERROR on select\n");
 
@@ -1245,7 +1290,7 @@ int main(int argc, const char *argv[])
                     clients = ClientList_push(clients, child->fd);
                     Table_put(sckt_to_msg, Atom_int(child->fd), 
                               HTTPMessage_new());
-                    printf("Accepted Connection %d\n", child->fd); // TODO remove
+                    //printf("Accepted Connection %d\n", child->fd); // TODO remove
                 }
                 else
                 {
@@ -1254,13 +1299,11 @@ int main(int argc, const char *argv[])
             }
             else // Data arriving from already connected socket
             {
-                //printf("Processing request on %d\n", sckt); // TODO remove
-
                 https_sckt = Table_get(server2client, Atom_int(sckt));
                 if (https_sckt)
                 {
                     // route from server to client
-                    printf("Tunneling from %d to %d\n", sckt, *https_sckt); // TODO remove
+                    //printf("Tunneling from %d to %d\n", sckt, *https_sckt); // TODO remove
                     if (!tunnel(sckt, *https_sckt))
                     {
                         close_client(&clients, &master_fds, *https_sckt, 
@@ -1270,7 +1313,7 @@ int main(int argc, const char *argv[])
                 else if ((https_sckt = Table_get(client2server, Atom_int(sckt))))
                 {
                     // route from client to server
-                    printf("Tunneling from %d to %d\n", sckt, *https_sckt); // TODO remove
+                    //printf("Tunneling from %d to %d\n", sckt, *https_sckt); // TODO remove
                     if (!tunnel(sckt, *https_sckt))
                     {
                         close_client(&clients, &master_fds, sckt, 
@@ -1287,7 +1330,7 @@ int main(int argc, const char *argv[])
                         Table_put(sckt_to_msg, Atom_int(sckt), req);
                     }
                     req->type = REQUEST;
-                    if (!read_sckt(sckt, req))
+                    if (!read_sckt(sckt, req, false))
                     {
                         res = HTTPMessage_new();
                         res->start_line = 
@@ -1305,10 +1348,10 @@ int main(int argc, const char *argv[])
                     }
                     else if (req->is_complete)
                     {
-                        printf("\nRequest Header\n"); 
-                        printf("%s", req->start_line);
-                        HeaderFieldsList_print(req->header);
-                        printf("\n"); // TODO remove
+                        //printf("\nRequest Header\n"); 
+                        //printf("%s", req->start_line);
+                        //HeaderFieldsList_print(req->header);
+                        //printf("\n"); // TODO remove
                         server_fd = process_req(req, sckt, &clients, cache, &https);
                         if(server_fd <= 0)
                         {
@@ -1339,7 +1382,7 @@ int main(int argc, const char *argv[])
                                 FREE(server_fd_store);
                                 FD_SET(server_fd, &master_fds);
                                 fdmax = MAX(server_fd, fdmax);
-                                printf("Added server connection %d\n", server_fd); // TODO remove
+                                //printf("Added server connection %d\n", server_fd); // TODO remove
                             }
                             else
                             {

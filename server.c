@@ -1381,7 +1381,6 @@ int main(int argc, const char *argv[])
                         res->is_complete = true;
                         write_msg(res, sckt);
                         HTTPMessage_free(&res);
-                        fprintf(stderr, "Bad request\n");
                         close_client(&clients, &master_fds, sckt, sckt_to_msg,
                             server2client, client2server);
                         continue;

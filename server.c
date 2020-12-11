@@ -177,6 +177,18 @@ void close_client(ClientList *clients, fd_set *master_fds, int sckt,
     }
 }
 
+bool allowaccess(char * host, char **firewall, int firesz)
+{
+    int i = 0;
+    while(i<firesz && strcmp(firewall[i],""))
+    {
+        if(!strcmp(host, firewall[i]))
+            return false;
+        i++;
+    }
+    return true;
+}
+
 /*
  * Function: write_msg
  * -------------------
@@ -1093,7 +1105,7 @@ bool tunnel(int from, int to)
  *   Returns file descriptor for server if successful and -1 otherwise.
  */
 int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
-    bool *https)
+    bool *https, char **firewall, int firewallsz)
 {
     int ret_val;
     char *method, *url, *protocol;
@@ -1103,7 +1115,7 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
     HTTPMessage res;
     int secs_to_live, age;
     char *age_hdr;
-    bool res_cached;
+    bool res_cached, forbidden;
 
     ret_val = -1;
     if (explode_start_line(req) && 
@@ -1118,7 +1130,9 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
         path = calloc(url_len, sizeof(*path));
         explode_url(url, host, port, path);
 
-        if (host[0] != '\0')
+        forbidden = false;
+        res_cached = false;
+        if (host[0] != '\0' && allowaccess(host, firewall, firewallsz))
         {
             if (port[0] == '\0')
                 strcpy(port, "80");
@@ -1139,7 +1153,6 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
                 
                 if (res == NULL)
                 {
-                    res_cached = false;
                     res = HTTPMessage_new();
                     res->type = RESPONSE;
                     if (!get_res(req, res, server_fd))
@@ -1171,7 +1184,6 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
             {
                 *https = true;
                 process_connection_header(req, protocol, client, clients);
-                res_cached = false;
                 res = HTTPMessage_new();
 
                 if (server_fd >= 0)
@@ -1186,34 +1198,51 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
             }
             else
                 ret_val = -1; 
-
-            if (res && ret_val != -1)
-            {
-                res->header = 
-                    HeaderFieldsList_remove(res->header, "Connection");
-                if (ClientList_keepalive(*clients, client))
-                    res->header = HeaderFieldsList_push(res->header, 
-                        strdup("Connection: keep-alive\r\n"));
-                else
-                    res->header = HeaderFieldsList_push(res->header, 
-                        strdup("Connection: close\r\n"));
-
-                //printf("Response Header:\n");
-                //printf("%s", res->start_line);
-                //HeaderFieldsList_print(res->header);
-                //printf("\n"); // TODO remove
-                
-                if (!write_msg(res, client))
-                {
-                    ret_val = -1;
-                    if (server_fd > 0)
-                        close(server_fd);
-                }
-            }
-
-            if (res && !res_cached)
-                HTTPMessage_free(&res);
         }
+        else if (host[0] != '\0')
+        {
+            forbidden = true;
+            res = HTTPMessage_new();
+            res->type = RESPONSE;
+            res->start_line = strdup("HTTP/1.1 403 Forbidden\r\n");
+            res->header = HeaderFieldsList_push(res->header, 
+                strdup("Connection: close\r\n"));
+            res->header = HeaderFieldsList_push(res->header,
+                strdup("Content-Length: 82\r\n"));
+            res->content_len = 82;
+            res->body = strdup("<html><body><h1>403 Forbidden</h1><p>Access blocked by firewall!</p></body></html>");
+            res->has_full_header = true;
+            res->is_complete = true;
+            ClientList_set_keepalive(*clients, client, false, -1);
+        }
+
+        if (res && (ret_val != -1 || forbidden))
+        {
+            res->header = 
+                HeaderFieldsList_remove(res->header, "Connection");
+            if (ClientList_keepalive(*clients, client))
+                res->header = HeaderFieldsList_push(res->header, 
+                    strdup("Connection: keep-alive\r\n"));
+            else
+                res->header = HeaderFieldsList_push(res->header, 
+                    strdup("Connection: close\r\n"));
+
+            //printf("Response Header:\n");
+            //printf("%s", res->start_line);
+            //HeaderFieldsList_print(res->header);
+            //printf("\n"); // TODO remove
+            
+            if (!write_msg(res, client))
+            {
+                ret_val = -1;
+                if (server_fd > 0)
+                    close(server_fd);
+            }
+        }
+
+        if (res && !res_cached)
+            HTTPMessage_free(&res);
+
         FREE(host);
         FREE(port);
         FREE(path);
@@ -1254,6 +1283,17 @@ int main(int argc, const char *argv[])
     FD_ZERO(&read_fds);
     FD_SET(parent->fd, &master_fds);
     fdmax = parent->fd;
+
+    //set up two dimensional pointers for blocked hostnames
+    //for now we will have a cap of 10 blocked hostnames
+    int firesz = 10;
+    char** firewall = malloc(sizeof(char*)*firesz);
+
+    //initialize values
+    for(int i = 0; i<firesz; i++)
+        firewall[i] = "";
+    char* fire1 = "www.cs.cmu.edu";
+    firewall[0] = strdup(fire1);
 
     signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE    
     clients = ClientList_new(); // initialize clients list
@@ -1352,7 +1392,8 @@ int main(int argc, const char *argv[])
                         //printf("%s", req->start_line);
                         //HeaderFieldsList_print(req->header);
                         //printf("\n"); // TODO remove
-                        server_fd = process_req(req, sckt, &clients, cache, &https);
+                        server_fd = process_req(req, sckt, &clients, cache, 
+                            &https, firewall, firesz);
                         if(server_fd <= 0)
                         {
                             close_client(&clients, &master_fds, sckt, 

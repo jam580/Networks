@@ -91,6 +91,19 @@ void HeaderFieldsList_print(HeaderFieldsList hfl)
     }
 }
 
+void HeaderFieldsList_file(HeaderFieldsList hfl, FILE* fp)
+{
+    HeaderFieldsList head;
+    char *line;
+    head = hfl;
+    while (head != NULL)
+    {
+        line = head->first;
+        fprintf(fp,"%s", line);
+        head = head->rest;
+    }
+}
+
 void HeaderFieldsList_free(HeaderFieldsList *hfl)
 {
     HeaderFieldsList head;

@@ -2,6 +2,7 @@
 #define HEADER_FIELDS_INCLUDED
 
 #include <stdlib.h>
+#include <stdio.h>
 #include "list.h"
 
 #define HeaderFieldsList List_T
@@ -15,5 +16,6 @@ extern char* HeaderFieldsList_get(HeaderFieldsList hfl, char *field);
 extern HeaderFieldsList HeaderFieldsList_pop(HeaderFieldsList hfl, char **x);
 extern void HeaderFieldsList_print(HeaderFieldsList hfl);
 extern void HeaderFieldsList_free(HeaderFieldsList *hfl);
+extern void HeaderFieldsList_file(HeaderFieldsList hfl, FILE * fp);
 
 #endif

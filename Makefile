@@ -35,22 +35,22 @@ EXECUTABLES = server
 CC = gcc
 
 # Updating include path to use current directory
-IFLAGS = -I.
+IFLAGS = -I/usr/include/python3.8
 
 # link against system software
-CFLAGS =  -g -Wall -Wextra $(IFLAGS)
-LIBS = -lnsl
+CFLAGS =  -g -Wall -Wextra $(IFLAGS) $(LIBS)
+LIBS = -lnsl -lpthread -lpython3.8
 
 # Linking flags, used in the linking step
 # Set debugging information and update linking path
 LDFLAGS = -g
 
 # Linking libraries
-LDLIBS = -lnsl
+LDLIBS = -lnsl -lpthread -lpython3.8
 
 ############### Targets ###############
 
-all: $(EXECUTABLES)
+all: $(EXECUTABLES) $(LIBS)
 
 clean:
 	rm -f $(EXECUTABLES) *.o a.out

@@ -5,6 +5,10 @@
 #include "table.h"
 #include "atom.h"
 #include "mem.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
 
 struct Cache_T {
     List_T keys;
@@ -48,12 +52,31 @@ void Cache_put(Cache_T cache, const char *key, void *value, int max_secs)
 void *Cache_get(Cache_T cache, const char *key, int *age)
 {
     Cache_Item item = Table_get(cache->cache, Atom_string(key));
-    
+    char filehold [50];
+    char conthold [50];
     if (item)
     {
         *age = time(NULL) - item->intime;
         if (*age > item->secs_to_live)
         {
+            unsigned char* id = malloc(strlen(key)*sizeof(unsigned char));
+            strncpy((char*) id, key, strlen(key));
+            unsigned long fn = hash(id);
+            sprintf(filehold, "files/%lu.txt", fn);
+            sprintf(conthold, "files/%lu.gz", fn);
+
+            char*filename = &filehold[0];
+            char*bodname= &conthold[0];
+            //if the file exists, remove it
+            if(access(filename, 0)==0)
+            {
+                remove(filename);
+            }
+            if(access(bodname,0)==0)
+            {
+                remove(bodname);
+            }
+                
             Cache_remove(cache, key);
             return NULL;
         }
@@ -113,4 +136,73 @@ void Cache_free(Cache_T *cache)
     List_free(&((*cache)->keys));
     Table_free(&((*cache)->cache));
     FREE(*cache);
+}
+
+// http://www.cse.yorku.ca/~oz/hash.html
+unsigned long hash(unsigned char const * input)
+{
+    unsigned long hash = 5382;
+    int c;
+
+    while( (c=*input++) )
+        hash = ((hash<<5)+hash)+c;
+
+    return hash;
+}
+
+//iterate through cache and write to files
+void Cache_write_out(Cache_T cache)
+{
+    HTTPMessage res;
+    char *key;
+    int age;
+    List_T head;
+    int i = 0;
+    char filehold [50];
+    char conthold [50];
+
+    head = cache->keys;
+    while(head!=NULL)
+    {
+        key = head->first;
+        List_T temp = head->rest;
+        if ((res = Cache_get(cache, key, &age))!=NULL)
+        {
+            //hash url for file id
+            unsigned char* id = malloc(strlen(key)*sizeof(unsigned char));
+            strncpy((char*) id, key, strlen(key));
+            unsigned long fn = hash(id);
+            sprintf(filehold, "files/%lu.txt", fn);
+            sprintf(conthold, "files/%lu.gz", fn);
+
+            char*filename = &filehold[0];
+            char*bodname = &conthold[0];
+            if(access(filename, 0)!= 0)
+            {
+                FILE * fp = fopen(filename, "w+");
+                if(fp==NULL)
+                    printf("Failed to open file");
+                //put url in file
+                printf("%s\n", key);
+                fprintf(fp, "%s\n", key);
+                //print headers to file
+                HeaderFieldsList_file(res->header, fp);
+                //print content to file
+                fprintf(fp, "sep\n");
+
+                fclose(fp);
+                //open new gzip file to write contents
+                fp = fopen(bodname, "wb+");
+                fwrite(res->body,1,res->content_len,fp);
+                fclose(fp);
+            }
+
+            printf("LETS GET THAT INFO\n");
+            
+        }
+        head = temp;
+        i++;
+    }
+    
+
 }

@@ -170,8 +170,10 @@ void Cache_write_out(Cache_T cache)
         {
             //hash url for file id
             unsigned char* id = malloc(strlen(key)*sizeof(unsigned char));
+            printf("url is: %s\n", key);
             strncpy((char*) id, key, strlen(key));
             unsigned long fn = hash(id);
+            printf("hash id: %lu", fn);
             sprintf(filehold, "files/%lu.txt", fn);
             sprintf(conthold, "files/%lu.gz", fn);
 
@@ -179,22 +181,44 @@ void Cache_write_out(Cache_T cache)
             char*bodname = &conthold[0];
             if(access(filename, 0)!= 0)
             {
-                FILE * fp = fopen(filename, "w+");
-                if(fp==NULL)
-                    printf("Failed to open file");
+                FILE * fp;
                 //put url in file
                 printf("%s\n", key);
-                fprintf(fp, "%s\n", key);
+                
                 //print headers to file
-                HeaderFieldsList_file(res->header, fp);
-                //print content to file
-                fprintf(fp, "sep\n");
+                char* encoding = "Content-Encoding";
+                printf("About to check for encoding \n");
+                if(HeaderFieldsList_get(res->header, encoding)!=NULL)
+                {
+                    printf("Endoing present\n");
+                    fp = fopen(filename, "w+");
+                    if(fp==NULL)
+                        printf("Failed to open file");
+                    fprintf(fp, "%s\n", key);
+                    HeaderFieldsList_file(res->header, fp);
+                    //print content to file
+                    fprintf(fp, "sep\n");
 
-                fclose(fp);
-                //open new gzip file to write contents
-                fp = fopen(bodname, "wb+");
-                fwrite(res->body,1,res->content_len,fp);
-                fclose(fp);
+                    fclose(fp);
+                    //open new gzip file to write contents
+                    fp = fopen(bodname, "wb+");
+                    fwrite(res->body,1,res->content_len,fp);
+                    fclose(fp);
+                }
+                else //if there is no encoding, payload is plaintext
+                {
+                    printf("No encoding\n");
+                    fp = fopen(filename, "w+");
+                     if(fp==NULL)
+                        printf("Failed to open file");
+                    fprintf(fp, "%s\n", key);
+                    HeaderFieldsList_file(res->header, fp);
+                    fprintf(fp, "sep\n");
+                    fwrite(res->body,1,res->content_len,fp);
+                    fclose(fp);
+                }
+                
+                    
             }
 
             printf("LETS GET THAT INFO\n");

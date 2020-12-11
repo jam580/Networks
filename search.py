@@ -32,6 +32,14 @@ class MH(tornado.web.RequestHandler):
                     #first grab the url
                     with open(filepath, 'r') as f:
                         url = f.readline()
+                        hold = f.readline()
+                        while hold !="sep\n":
+                            print("Header field")
+                            hold = f.readline()
+                        alldata = f.read()
+                        for word in querry:
+                            if word in alldata:
+                                includes.append(url)
                     confile = filepath[:-4] +".gz"
                     #now search through the contents of the url
                     try:
@@ -42,7 +50,7 @@ class MH(tornado.web.RequestHandler):
                                 if word in alldata:
                                     includes.append(url)
                     except:
-                        print("file has bad content")
+                        print("file doesn't have gzip encoding")
         #at this point all files have been querried
         self.write('<!Doctype html>'
         '<html>'

@@ -65,21 +65,7 @@ void Chunk_free(Chunk *c)
     *c = NULL;
 }
 
-typedef struct HTTPMessage{
-    char *start_line;
-    char *start_line_elts[3];
-    HeaderFieldsList header;
-    HeaderFieldsList trailer;
-    char *body;
-    List_T chunks;
-    size_t content_len;
-    size_t body_remaining;
-    bool has_full_header;
-    bool is_complete;
-    char *unprocessed;
-    int bytes_unprocessed;
-    int type;
-} *HTTPMessage;
+
 #define NOT_SPECIFIED 0
 #define REQUEST 1
 #define RESPONSE 2
@@ -109,7 +95,6 @@ void * launchServe()
         if(pFunc && PyCallable_Check(pFunc))
         {
 
-            printf("Yeehaw\n");
             //run the function in question, store return value
             pValue = PyObject_CallObject(pFunc,NULL);
 
@@ -1358,7 +1343,7 @@ int main(int argc, const char *argv[])
     //initialize values
     for(int i = 0; i<firesz; i++)
         firewall[i] = "";
-    char* fire1 = "www.cs.cmu.edu";
+    char* fire1 = "www.cs.tufts.edu";
     firewall[0] = strdup(fire1);
 
     signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE    

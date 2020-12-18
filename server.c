@@ -35,7 +35,7 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-#define BUFF_SIZE 10240
+#define BUFF_SIZE 65536
 
 typedef struct Chunk{
     size_t len;
@@ -491,13 +491,13 @@ int get_chunk(char **body, int *bytes, HTTPMessage msg)
 {
     Chunk c;
     size_t chunk_size_len, chunk_data_bytes;
-    char *chunk_size, *end_ptr;
+    char *chunk_size;
 
     chunk_size = get_line(body, bytes);
     if (chunk_size != NULL)
     {
         chunk_size_len = strlen(chunk_size);
-        chunk_data_bytes = strtoul(chunk_size, &end_ptr, 10);
+        sscanf(chunk_size, "%lx", &chunk_data_bytes);
         if (chunk_data_bytes == 0)
         {
             c = Chunk_new();
@@ -519,7 +519,12 @@ int get_chunk(char **body, int *bytes, HTTPMessage msg)
             FREE(chunk_size);
         }
         else
+        {
+            *body = *body - chunk_size_len;
+            *bytes = *bytes + chunk_size_len;
             FREE(chunk_size);
+            return 0;
+        }
         return chunk_data_bytes;
     }
 
@@ -1229,7 +1234,7 @@ int process_req(HTTPMessage req, int client, ClientList *clients, Cache_T cache,
                     res->header = HeaderFieldsList_push(res->header, age_hdr);
                 }
             }
-            else if (strcmp(method, "CONNECT") == 0)
+            else if (server_fd >= 0 && strcmp(method, "CONNECT") == 0)
             {
                 *https = true;
                 process_connection_header(req, protocol, client, clients);

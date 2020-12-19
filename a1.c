@@ -1,3 +1,16 @@
+/*******************************************************************************
+*
+* Tufts University
+* COMP112 (Networks) - Final Project
+* By: Ramon Fernandes & James Mattei
+* Last Edited: December 2, 2020
+*                               
+* server.c - main processor for an HTTP proxy server application
+* Command Arguments:
+*      port: port to listen on for incoming connections
+*
+*******************************************************************************/
+
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -9,11 +22,18 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <signal.h>
+#include <ctype.h>
+#include <stdbool.h>
+#include <assert.h>
 #include "failure.h"
 #include "mem.h"
+#include "clientlist.h"
+#include "headerfieldslist.h"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+#define BUFF_SIZE 10000
 
 struct blockstruct
 {
@@ -28,7 +48,7 @@ typedef struct blockstruct Block;
 Block* initBlock()
 {
     Block* b1 = malloc(sizeof(Block));
-    b1->Object = (char*) malloc(1024*10240);
+    b1->Object = NULL;
     b1->key = calloc(100, sizeof(char));
     b1->valid = 0;
     b1->firstline = calloc(1, sizeof(char));
@@ -96,6 +116,135 @@ int find(char* url, Cache* cache)
     }
     return -1;
 }
+
+/*
+ * Processes the given Keep-Alive header and stores relevant information in
+ * client info. A NULL keep_alive does not alter the existing keep_alive config.
+ */
+void process_keep_alive(ClientList cl, int clientsock, char *keep_alive)
+{
+    int start, stop, timeout;
+    bool more_directives;
+    char tmp;
+    start = 12;
+    more_directives = true;
+
+    if (keep_alive == NULL)
+        return;
+
+    while (more_directives)
+    {
+        while (keep_alive[start] == ' ')
+            start++;
+        stop = start;
+        while (keep_alive[stop] != ',' && keep_alive[stop] != '\r' && 
+               keep_alive[stop] != '\n')
+            stop++;
+        if (keep_alive[stop] != ',')
+            more_directives = false;
+
+        if (strncasecmp("timeout", keep_alive+start, stop-start) == 0)
+        {
+            tmp = keep_alive[stop];
+            keep_alive[stop] = '\0';
+            timeout = atoi(keep_alive + start + 8);
+            ClientList_set_keepalive(cl, clientsock, true, timeout);
+            keep_alive[stop] = tmp;
+            break;
+        }
+        start = stop+1;
+    }
+}
+
+bool process_header_buf(char *buf, int *bytes, HeaderFieldsList *hf)
+{
+    int i;
+    char *new_buf, *line;
+    bool end_of_header;
+
+    i = 0;
+    new_buf = buf;
+    end_of_header = false;
+    while (i < *bytes && !end_of_header)
+    {
+        if (*new_buf != '\n') // keep searching until end of line
+        {
+            // do nothing
+        }
+        else if (strncmp(buf, "\r\n", 2) == 0) // last line
+        {
+            end_of_header = true;
+            buf = new_buf + 1;
+        }
+        else
+        {
+            line = calloc(new_buf - buf + 2, sizeof(*line));
+            memcpy(line, buf, new_buf - buf + 1);
+            *hf = HeaderFieldsList_push(*hf, line);
+            FREE(line);
+            buf = new_buf + 1;
+        }
+        
+        i++;
+        new_buf++;
+    }
+
+    if (i == *bytes)
+    {
+        *bytes = 0;
+        buf = NULL;
+    }
+    else
+    {
+        *bytes = new_buf - buf;
+        buf = buf + i;
+    }
+
+    return end_of_header;
+}
+
+HeaderFieldsList read_header(int sckt, char *buf, int *bytes)
+{
+    HeaderFieldsList header_fields;
+    int i, new_bytes;
+    char *new_buf;
+    bool first_line_read, end_of_header;
+
+    header_fields = HeaderFieldsList_new();
+    i = 0;
+    new_buf = buf;
+    first_line_read = false;
+    end_of_header = false;
+
+    // skip over first line
+    while (i < *bytes && !first_line_read)
+    {
+        if (*new_buf == '\n')
+            first_line_read = true;
+        i++;
+        new_buf++;
+    }
+
+    new_buf = calloc(BUFF_SIZE, sizeof(*new_buf));
+    *bytes = *bytes - i; 
+    buf = buf + i;
+    if (i != *bytes)
+        end_of_header = process_header_buf(buf, bytes, &header_fields);
+
+    while (!end_of_header)
+    {
+        if (buf != NULL)
+            memcpy(new_buf, buf, *bytes);
+        new_bytes = read(sckt, new_buf + *bytes, BUFF_SIZE);
+        end_of_header = process_header_buf(new_buf, &new_bytes, &header_fields);
+    }
+
+    buf = new_buf;
+    *bytes = new_bytes;
+
+    return header_fields;
+}
+
 static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, FILE* sockwfp, FILE * clientsock, Cache* cache, char*url)
 {
     int client_read, server_read, client_write, server_write;
@@ -166,16 +315,18 @@ static void relay_ssl(char* method, char* host, char* protocol, FILE* sockrfp, F
     }
 }
 
-static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, FILE* sockwfp, FILE* clientsock, Cache* cache, char* url)
+static void relay_http(char* method, char* path, char* protocol, int serverfd, int clientfd, Cache* cache, char* url, ClientList cl, char *buf, int bytes)
 {
     char line[10000], prot[10000], coms[10000];
-    int first_line, stat;
+    int first_line, stat, new_bytes;
     char hold;
     long con_length =-1;
     long i;
     int found = -1; //bool to dictate cache hit
-    char* endptr;
-    double age;
+    char* endptr, *obj, *obj_tmp;
+    int age;
+    HeaderFieldsList header_fields;
+    bool keepalive = true;
 
     //look for cache hit
     update(cache);
@@ -184,13 +335,21 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
     //if there is a cache hit
     if(found!=-1)
     {
-        fprintf(clientsock, "%s",cache->Entries[found]->firstline);
-        fflush(clientsock);
+        printf("Cache hit\n");
+        obj = cache->Entries[found]->Object;
+        while(strncmp(obj, "\r\n", 2) != 0)
+        {
+            if (strncasecmp(obj, "Content-Length:", 15) == 0)
+                con_length=atol( &(obj[15]));
+            obj_tmp = strchr(obj, '\n') + 1;
+            new_bytes = write(clientfd, obj, obj_tmp - obj + 1); // write line
+        }
         long currentage = (long) time(NULL) - (long) cache->Entries[found]->intime;
-        fprintf(clientsock, "Age: %ld \n",currentage);
-        fflush(clientsock);
-        fprintf(clientsock, "%s", cache->Entries[found]->Object);
-        fflush(clientsock);
+        new_bytes = write(clientfd, "Age: %ld \r\n\r\n", currentage);
+        obj += 2; // blank new line
+
+        if(con_length != -1)
+            new_bytes = write(clientfd, obj, con_length);
 
         //now that we've sent the item, move it to front of cache
         Block* temp = cache->Entries[found];
@@ -198,43 +357,117 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
             cache->Entries[i]=cache->Entries[i-1];
         cache->Entries[0]=temp;
         temp=NULL;
+
         //flush the remainder of the client request
-        while(fgets(line, sizeof(line), stdin) != (char*)0 )
+        header_fields = read_header(clientfd, buf, &bytes);
+        char *field = HeaderFieldsList_get(header_fields, "Content-Length");
+        
+        if (field != NULL)
         {
-            if( strcmp( line, "\n" ) == 0 || strcmp( line, "\r\n" ) == 0 )
-                break;
-            if( strncasecmp(line, "Content-Length:", 15) ==0)
-                con_length=atol( &(line[15]));
+            con_length = atol(field + 15);
+            new_bytes = 1;
+            for(i = 0; i < con_length && bytes == 1; i++)
+                new_bytes = read(clientfd, &hold, 1);
         }
-        if(con_length !=-1)
-            for(i=0; i<con_length && (hold = getchar())!= EOF; i++ );
     }//end of cache hit
     else
     {
+        printf("Not in cache\n");
+        header_fields = HeaderFieldsList_new();
         //First send http request, add back the \r\n
-        fprintf(sockwfp, "%s %s %s\r\n", method, path, protocol);
-        //make sure all info is sent
-        while(fgets(line, sizeof(line), stdin) != (char*)0 )
+        new_bytes = write(serverfd, buf, strchr(buf, '\n') - buf + 1);
+        header_fields = read_header(clientfd, buf, &bytes);
+        printf("Finished reading header\n");
+        // Check for Connection
+        char *field = HeaderFieldsList_get(header_fields, "Connection");
+        if (field != NULL)
         {
-            //printf("Next line is: %s\n", line);
-            if( strcmp( line, "\n" ) == 0 || strcmp( line, "\r\n" ) == 0 )
-                break;
-            fputs(line, sockwfp);
-            trim(line);
-            if( strncasecmp(line, "Content-Length:", 15) ==0)
-                con_length=atol( &(line[15]));
+            printf("Connection header found -- %s", field);
+            int start = 12, stop;
+            char tmp;
+            bool more_directives = true;
+        
+            if (strncasecmp(protocol, "HTTP/1.0", 8) == 0)
+            {
+                // Proxies are not allowed to persist connections with 1.0 clients (RFC 7230 pg. 53)
+                ClientList_set_keepalive(cl, clientfd, false, -1);
+                keepalive = false;
+            }
+            else 
+            {
+                while (more_directives)
+                {
+                    printf("getting directives -- %s", field + start);
+                    while (field[start] == ' ')
+                        start++;
+                    stop = start;
+                    while (field[stop] != ',' && field[stop] != '\r' &&
+                        field[stop] != '\n')
+                        stop++;
+                    if (field[stop] != ',')
+                        more_directives = false;
+                    
+                    if (strncasecmp("close", field+start, stop-start) == 0)
+                    {
+                        ClientList_set_keepalive(cl, clientfd, false, -1);
+                        keepalive = false;
+                        break;
+                    }
+                    if (strncasecmp("Keep-Alive", 
+                                    field + start, stop-start) == 0) 
+                    {
+                        process_keep_alive(cl, clientfd, 
+                            HeaderFieldsList_get(header_fields, "Keep-Alive"));
+                        printf("is keep-alive\n");
+                    }
+
+                    tmp = field[stop];
+                    field[stop] = '\0';
+                    header_fields = HeaderFieldsList_remove(header_fields, 
+                                                                field + start);
+                    field[stop] = tmp;
+                    start = stop+1;
+                }
+            }
+            memcpy(field + 12, "close\r\n", 8);
         }
-        // flush to make sure all forwarded
-        fputs(line, sockwfp);
-        fflush(sockwfp);
+        else
+        {
+            if (strncasecmp(protocol, "HTTP/1.0", 8) == 0)
+            {
+                // Proxies are not allowed to persist connections with 1.0 clients (RFC 7230 pg. 53)
+                ClientList_set_keepalive(cl, clientfd, false, -1);
+                keepalive = false;
+            }
+            HeaderFieldsList_push(header_fields, "Connection: close\r\n");
+        }
+
+        header_fields = HeaderFieldsList_pop(header_fields, &field);
+        new_bytes = 1;
+        while(field != NULL && new_bytes > 0)
+        {
+            new_bytes = write(serverfd, field, strlen(field));
+            if( strncasecmp(field, "Content-Length:", 15) ==0)
+                con_length=atol( &(field[15]));
+            FREE(field);
+            header_fields = HeaderFieldsList_pop(header_fields, &field);
+        }
+        new_bytes = write(serverfd, "\r\n", 2);
+        
         //check for content and flush every char
         if(con_length !=-1)
         {
-            for(i=0; i<con_length && (hold = getchar())!= EOF; i++ )
-                putc(hold, sockwfp);
+            for(i=0; i<con_length; i++ )
+            {
+                if (bytes - i > 0)
+                    new_bytes = write(serverfd, buf + i, 1);
+                else
+                {
+                    read(clientfd, buf, 1);
+                    write(serverfd, buf, 1);
+                }
+            }
         }
-        
-        fflush(sockwfp);
 
         //recieve response form server and forward to client
         char* buff = calloc(1024*1024, sizeof(char));
@@ -243,48 +476,69 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         stat = -1;
         int cacheage = 0;
         char* firstlen;
-        while( fgets(line, sizeof(line), sockrfp)!= (char*) 0)
+
+        bytes = read(serverfd, buff, 1024*1024);
+        header_fields = read_header(serverfd, buff, &bytes);
+        field = HeaderFieldsList_get(header_fields, "Connection");
+        if (field != NULL)
         {
-            //printf("Newline inside relayhttp: %s\n", line);
-            
-            if( strcmp(line, "\n") ==0 || strcmp(line, "\r\n") ==0 )
-                break;
-            if( first_line)
-            {
-                firstlen = strdup(line);
-                fprintf(clientsock, "%s", line);
-                fflush(clientsock);
-                strcpy(buff, line);
-                trim(line);
-                sscanf(line, "%[^ ] %d %s", prot, &stat, coms);
-                first_line=0;
-            }
+            if (keepalive)
+                memcpy(field + 12, "keep-alive\r\n", 13);
             else
+                memcpy(field + 12, "close\r\n", 8);
+        }
+        else
+        {
+            if (keepalive)
+                header_fields = HeaderFieldsList_push(
+                                    header_fields, 
+                                    "Connection: keep-alive\r\n");
+            else
+                header_fields = HeaderFieldsList_push(
+                                    header_fields, 
+                                    "Connection: close\r\n");
+        }
+
+        field = HeaderFieldsList_get(header_fields, "Content-Length");
+        if (field != NULL)
+            con_length = atol(field + 15);
+        
+        field = HeaderFieldsList_get(header_fields, "Cache-Control:");
+        if (field != NULL)
+        {
+            int start = 12, stop;
+            bool more_directives = true;
+            while (more_directives)
             {
-                strcat(buff,line);
-                fprintf(clientsock, "%s", line);
-                fflush(clientsock);
-                trim( line);
-                
-                if (strncasecmp(line, "Content-Length:",15)==0)
-                    con_length = atol( &(line[15]));
-                if (strncasecmp(line, "Cache-Control: max-age=",23)==0)
+                while(field[start] == ' ')
+                    start++;
+                stop = start;
+                while (field[stop] != ',' && field[stop] != '\r' && field[stop] != '\n')
+                    stop++;
+                if (field[stop] != ',')
+                    more_directives = false;
+
+                if (strncasecmp("max-age", field+start, stop-start) == 0)
                 {
-                    age = strtod(&(line[23]), &endptr);
+                    age = atoi(line + start + 8);
                     cacheage = 1;
                 }
-            }    
-        } //end of reading headers
+                start = stop+1;
+            }
+        }
+
+        header_fields = HeaderFieldsList_pop(header_fields, &field);
+        new_bytes = 1;
+        while(field != NULL && new_bytes > 0)
+        {
+            new_bytes = write(clientfd, field, strlen(field));
+            FREE(field);
+            header_fields = HeaderFieldsList_pop(header_fields, &field);
+        }
+        new_bytes = write(clientfd, "\r\n", 2);
+
         if(!cacheage)
             age = 3600;
-        //Add the end of the header
-        char* end = "\r\n";
-        //fprintf(clientsock, "%s", end); 
-        fprintf(clientsock, "%s", end);
-        fflush(clientsock);
-        
-        strcat(buff,end);
-        //strcat(buff,"Connection: close\r\n");
 
         //check for content
         if(con_length != -1)
@@ -292,16 +546,18 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
             printf("We have %ld content\n", con_length);
             for(i=0; i<con_length; i++)
             {
-                hold = fgetc(sockrfp);
-                //fputc(hold,clientsock);
-                //fflush(clientsock);
-                strncat(buff,&hold,1); // TODO: store partial messages in case buff is not big enough
-                fprintf(clientsock,"%c", hold);
-                
+                new_bytes = read(serverfd, &hold, 1);
+                //memcpy(cache->Entries[found]->Object + header_len + i, &hold, 1);
+                write(clientfd, &hold, 1);
             }
         }
-        //flush content to client
-        fflush(clientsock);
+        FREE(buff);
+
+
+        /*
+        strcat(buff,end);
+        size_t header_len = strlen(buff);
+        //strcat(buff,"Connection: close\r\n");
 
         //Cache value - found should be -1
         for(int i =0; i< cache->sz;i++)
@@ -317,7 +573,10 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
 
         //found is the right index 
         cache->Entries[found]->valid=1;
-        strcpy(cache->Entries[found]->Object, buff);
+        FREE(cache->Entries[found]->Object);
+        cache->Entries[found]->Object = malloc(header_len + con_length);
+        memcpy(cache->Entries[found]->Object, buff, header_len);
+
         //update key to url
         strcpy(cache->Entries[found]->key, url);
         cache->Entries[found]->maxage=age;
@@ -326,11 +585,113 @@ static void relay_http(char* method, char* path, char* protocol, FILE* sockrfp, 
         cache->Entries[found]->firstline=strdup(firstlen);
         //value is now cached
         FREE(firstlen);
-        FREE(buff);
+        FREE(buff);*/
+        HeaderFieldsList_free(&header_fields);
     }//end of cache miss   
 }
 
-int main(int argc, char **argv) {
+void close_client(ClientList *clients, fd_set *master_fds, int socket)
+{
+    printf("Closing connection\n");
+    close(socket);
+    FD_CLR(socket, master_fds);
+    *clients = ClientList_remove(*clients, socket);
+}
+
+void check_usage(int argc, const char* argv[])
+{
+    if (argc != 2) 
+    {
+        // need to add 2 for extra space around %s and for the null terminator.
+        int buffer_size = strlen("Usage: %s <port>\n") + strlen(argv[0]) + 2;
+        char msg[buffer_size];
+        sprintf(msg, "Usage: %s <port>\n", argv[0]);
+        exit_failure(msg);
+    }
+}
+
+int strcpy_until(char *src, char *dest, int start, int max, char delim)
+{
+    int j = 0;
+    while (src[start] != delim && start < max)
+    {
+        memcpy(dest + j, src + start, 1);
+        start++;
+        j++;
+    }
+    dest[j] = '\0';
+
+    return j;
+}
+
+/*
+ * Split the start line in buf into the method, the request-target, and the 
+ * protocol version. More info in RFC 7230, pg. 21. Reads for max bytes given.
+ * 
+ * Returns true if successfully parsed or false otherwise.
+ * 
+ * // TODO: currently this assumes properly formatted start line
+ */
+bool explode_start_line(char *buf, char *method, char *url, 
+    char *protocol, int bytes)
+{
+    assert(buf);
+    int i = 0, copied;
+
+    i += strcpy_until(buf, method, i, bytes, ' ');
+    if (i >= bytes)
+        return false;
+
+    i += strcpy_until(buf, url, ++i, bytes, ' ');
+    if (i >= bytes)
+        return false;
+
+    copied = strcpy_until(buf, protocol, ++i, bytes, '\n');
+    if (i + copied >= bytes)
+        return false;
+    if (protocol[copied - 1] == '\r')
+        protocol[copied - 1] = '\0';
+
+    return true;
+}
+
+/*
+ * Break apart the url into host, path, and port if they exist.
+ * References: https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
+ * 
+ * Returns true if successfully parsed or false otherwise.
+ */
+bool explode_url(char *url, char *host, int *port, char *path)
+{
+    if (sscanf(url, "http://%[^:]:%d%s", host, port, path) == 3 ||
+        sscanf(url, "https://%[^:]:%d%s", host, port, path) == 3)
+    {
+        // do nothing
+    }
+    else if (sscanf(url, "http://%[^:/]%s", host, path) == 2 ||
+             sscanf(url, "https://%[^:/]%s", host, path) == 2)
+    {
+        *port = -1;
+    }
+    /*
+    else if (sscanf( url, "http://%[^:/]:%d", host, &accessport)==2)
+    {
+        finport = (unsigned short) accessport;
+        *path = '\0';
+    }
+    else if (sscanf (url, "http://%[^/]", host)==1)
+    {
+        finport = 80;
+        *path = '\0';
+    }*/
+    else
+    {
+        return false;
+    }
+    return true;
+}
+
+int main(int argc, const char **argv) {
     //Arrays to be used for HTTP header
     char line[10000], method[10000], url[10000], protocol[10000], host[10000], path[10000];
     int parentfd; // parent socket 
@@ -344,24 +705,21 @@ int main(int argc, char **argv) {
     FILE* sockrfp; // read socket file 
     FILE* sockwfp;// write socket file 
     struct sockaddr_in serveraddr; // server's addr 
-    Cache* cache = initCache(10);
+    Cache* cache = initCache(100);
     fd_set master_fds;
     fd_set read_fds;
     int fdmax;
     int sckt; // looping variable
+    ClientList clients;
+    int bytes;
 
-    //check command line arguments 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
-        exit(1);
-    }
+    check_usage(argc, argv);
     portno = atoi(argv[1]);
-
     
     // socket: create the parent socket 
     parentfd = socket(AF_INET, SOCK_STREAM, 0);
     if (parentfd < 0) 
-        error("ERROR opening socket");
+        exit_failure("ERROR opening socket\n");
 
     //command to kill the server and avoid "already in use error"
     //taken from example server
@@ -382,13 +740,13 @@ int main(int argc, char **argv) {
     //bind: associate the parent socket with a port 
     if (bind(parentfd, (struct sockaddr *) &serveraddr, 
         sizeof(serveraddr)) < 0) 
-        error("ERROR on binding");
+        exit_failure("ERROR on binding\n");
 
     /* 
     * listen: make this socket ready to accept connection requests 
     */
     if (listen(parentfd, 5) < 0) // allow 5 requests to queue up  
-        error("ERROR on listen");
+        exit_failure("ERROR on listen\n");
 
     /*
      * Clear memory in fdsets
@@ -400,11 +758,17 @@ int main(int argc, char **argv) {
 
     signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE
 
+    clients = ClientList_new();
+
     /***************************************************
      ****** main loop to handle socket connections******
      ***************************************************/
     memset(&addresslen, '\0', sizeof(addresslen));
     while(1){
+        for (sckt = 0; sckt <= fdmax; sckt++) 
+            if (!ClientList_keepalive(clients, sckt))
+                close_client(&clients, &master_fds, sckt);
+
         read_fds = master_fds;
 
         /*
@@ -422,6 +786,7 @@ int main(int argc, char **argv) {
             if (sckt == parentfd) 
             {
                 /* Incoming connection request */
+                printf("Accepting new connection\n");
                 childfd = accept(parentfd, (struct sockaddr *) &serveraddr, &addresslen);
                 if (childfd < 0) 
                 {
@@ -431,111 +796,75 @@ int main(int argc, char **argv) {
                 {
                     FD_SET(childfd, &master_fds);
                     fdmax = MAX(childfd, fdmax);
+                    clients = ClientList_push(clients, childfd);
                 }
             } 
             else 
             {
                 childfd = sckt;
                 /* Data arriving from already connected socket */
-                // int stdin_save = dup(STDIN_FILENO); // saved stdin for potential reset 
-                dup2(childfd,STDIN_FILENO); // set stdin to client socket 
 
-                //start reading request from STDIN
-                if( fgets(line, sizeof(line)-1, stdin)== (char*)0)
+                if ((bytes = read(sckt, line, sizeof(line)-1)) <= 0)
                 {
-                    fprintf(stderr, "Failed to get Request\n");
-                    close(childfd);
-                    FD_CLR(childfd, &master_fds);
+                    fprintf(stderr, "Failed to read\n");
+                    close_client(&clients, &master_fds, childfd);
                     continue;
                 }
-                printf("Just got line %s\n", line);
-                //clean up and parse request
-                trim(line);
-                if(sscanf( line, "%[^ ] %[^ ] %[^ ]", method, url, protocol ) != 3 )
+
+                if (!explode_start_line(line, method, url, protocol, bytes))
                 {
-                    printf("Line is: %s\n", line);
+                    printf("Request is: %s\n", line);
                     fprintf(stderr, "Failed to Parse Request\n");
-                    close(childfd);
-                    FD_CLR(childfd, &master_fds);
+                    close_client(&clients, &master_fds, childfd);
                     continue;
                 }
 
-                if(url[0] == '\0')
+                if(url[0] == '\0') // TODO: why is this necessary?
                 {
                     fprintf(stderr, "Bad url on Request\n");
-                    close(childfd);
-                    FD_CLR(childfd, &master_fds);
+                    close_client(&clients, &master_fds, childfd);
                     continue;
                 }
                 
                 update(cache);
                 if(strcmp(method, "GET") == 0 && strncasecmp(url, "http://", 7) == 0)
                 {
-                    memcpy( url, "http", 4 );
-
-                    if(sscanf( url, "http://%[^:/]:%d%s", host, &accessport, path)==3)
-                        finport = (unsigned short) accessport;
-                    //if no port is specified assume 80
-                    else if (sscanf( url, "http://%[^:/]%s", host, path)==2)
-                        finport = 80;
-                    /*
-                    else if (sscanf( url, "http://%[^:/]:%d", host, &accessport)==2)
+                    if(!explode_url(url, host, &accessport, path))
                     {
-                        finport = (unsigned short) accessport;
-                        *path = '\0';
-                    }
-                    else if (sscanf (url, "http://%[^/]", host)==1)
-                    {
-                        finport = 80;
-                        *path = '\0';
-                    }
-                    else
-                    {
-                        fprintf(stderr, "Could not sscanf on url\n");
-                        close(childfd);
-                        FD_CLR(childfd, &master_fds);
+                        fprintf(stderr, "Failed to parse url\n");
+                        close_client(&clients, &master_fds, childfd);
                         continue;
-                    }*/
+                    }
+                    if (accessport == -1)
+                        finport = 80;
+                    else
+                        finport = (unsigned short) accessport;
+                    
                     https = 0;    
                 }
                 else if (strcmp(method, "CONNECT")==0) //check for https request
                 {
-                    if (sscanf(url, "%[^:]:%d", host, &accessport) ==2)
-                        finport = (unsigned short) accessport;
-                    else if (sscanf(url, "%s", host)==1)
-                        finport = 443;
-                    else
+                    if(!explode_url(url, host, &accessport, path))
                     {
-                        fprintf(stderr, "Failed to parse https url\n");
-                        close(childfd);
-                        FD_CLR(childfd, &master_fds);
+                        fprintf(stderr, "Failed to parse url\n");
+                        close_client(&clients, &master_fds, childfd);
                         continue;
                     }
                     https = 1;
                 }
-                else
+                else // TODO: Add support for POST
                 {
                         fprintf(stderr, "Unsupported method\n");
-                        close(childfd);
-                        FD_CLR(childfd, &master_fds);
+                        close_client(&clients, &master_fds, childfd);
                         continue;
                 }
-                
-
-                //break apart the url and get host / path / port if they exist
-                //I referenced a few pages to help with this part including:
-                //https://cboard.cprogramming.com/c-programming/112381-using-sscanf-parse-string.html
-
-                //if sscanf properly parses hostname into host buffer, a port number into accessport, 
-                // and the rest into path
-
 
                 //Start building destination
                 //build the server's Internet address
                 struct addrinfo destaddr; //destinatrion addr
                 char portarray[10];
                 struct addrinfo* fullinfo;
-                struct sockaddr_in6 finsock;\
+                struct sockaddr_in6 finsock;
                 int sock_fam, sock_type, sock_prot, sock_len;
                 int serversock;
                 //initialize some values
@@ -549,9 +878,8 @@ int main(int argc, char **argv) {
                 //perform lookup
                 if( (getaddrinfo(host, portarray, &destaddr, &fullinfo))!=0)
                 {
-                    fprintf(stderr, "Bad address not found");
-                    close(childfd);
-                    FD_CLR(childfd, &master_fds);
+                    fprintf(stderr, "Bad address not found\n");
+                    close_client(&clients, &master_fds, childfd);
                     freeaddrinfo(fullinfo);
                     continue;
                 }
@@ -597,16 +925,14 @@ int main(int argc, char **argv) {
                 serversock = socket(sock_fam, sock_type, sock_prot);
                 if(serversock<0)
                 {
-                    fprintf(stderr, "Couldnt form server socket");
-                    close(childfd);
-                    FD_CLR(childfd, &master_fds);
+                    fprintf(stderr, "Couldn't form server socket\n");
+                    close_client(&clients, &master_fds, childfd);
                     continue;
                 }
                 if( connect(serversock, (struct sockaddr*) &finsock, sock_len) <0) 
                 {
-                    fprintf(stderr, "Couldn't connect to server");
-                    close(childfd);
-                    FD_CLR(childfd, &master_fds);
+                    fprintf(stderr, "Couldn't connect to server\n");
+                    close_client(&clients, &master_fds, childfd);
                     continue;
                 }
 
@@ -627,24 +953,17 @@ int main(int argc, char **argv) {
                 {
                     printf("routing client\n");
                     printf("url is: %s\n", url);
-                    relay_http(method, path, protocol, sockrfp, sockwfp, clientsock, cache, url);
+                    relay_http(method, path, protocol, serversock, childfd, cache, url, clients, line, bytes);
                     printf("Finished routing\n");
                 }
-                /*
-                //flush input
-                while(fgets(line, sizeof(line), stdin) != (char*)0 )
-                {
-                    printf("Line is: %s\n", line);
-                }*/
+
                 freeaddrinfo(fullinfo);
                 close(serversock);
-                //dup2(stdin_save,STDIN_FILENO);
-                //close(childfd); // TODO: add support to keep-alive
-                //FD_CLR(childfd, &master_fds);
             }
         }
     }//while loop
-    
+
+    ClientList_free(&clients);   
 }
 
 
